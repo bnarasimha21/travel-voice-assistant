@@ -12,7 +12,7 @@ A voice-enabled conversational chatbot that acts as a Southern California travel
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - CUDA-compatible GPU (recommended for optimal performance)
 - Microphone for voice input
 - Speakers for audio output
@@ -35,17 +35,16 @@ A voice-enabled conversational chatbot that acts as a Southern California travel
    DIGITALOCEAN_GENAI_ACCESS_TOKEN_TRAVEL=your_api_key_here
    ```
 4. For Kokoro + ONNX TTS
-Download the following files from their GitHub page: [Kokoro](https://github.com/thewh1teagle/kokoro-onnx/blob/main/examples/app.py)
+Download the following model files from the [kokoro-onnx releases](https://github.com/thewh1teagle/kokoro-onnx/releases) and place them in the project root (next to `conv_agent.py`), since the app loads them by relative path at startup:
 
 - kokoro-v1.0.onnx
 - voices-v1.0.bin
 
 5. Additional Requirements
-For MacOS/Linux assuming you have already installed xcode developer tools, this also requires brew installing for the Microphone capabilities:
+Audio playback uses `sounddevice`, which needs PortAudio. It is bundled on macOS and Windows wheels; on Linux install it first:
 
 ```
-brew install portaudio
-pip install pyaudio
+sudo apt-get install libportaudio2
 ```
 
 ## Screenshot

@@ -51,16 +51,14 @@ openai_client = openai.OpenAI(
 # Initialize conversation history
 conversation_history = [
     {
-        "role": "assistant",
+        "role": "system",
         "content": "You are a Southern California Travel Agency Assistant. Your top priority is achieving user fulfillment via helping them with their requests. Limit all responses to 2 concise sentences and no more than 100 words.",
     },
 ]
 
-transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo")
-
 def transcribe(audio, history):
     if audio is None:
-        return history
+        return history, None
     
     sr, y = audio
     
@@ -69,9 +67,15 @@ def transcribe(audio, history):
         y = y.mean(axis=1)
         
     y = y.astype(np.float32)
-    y /= np.max(np.abs(y))
+    peak = np.max(np.abs(y)) if y.size else 0.0
+    if peak == 0:
+        # Silent or empty recording: nothing to transcribe (avoids divide by zero / NaN)
+        return history, None
+    y /= peak
 
-    transcript = transcriber({"sampling_rate": sr, "raw": y})["text"]  
+    transcript = asr_pipeline({"sampling_rate": sr, "raw": y})["text"].strip()
+    if not transcript:
+        return history, None
 
     # Add user message to conversation history
     conversation_history.append(
@@ -93,11 +97,12 @@ def transcribe(audio, history):
     # Play the response
     play_response(assistant_response)
     
-    audio.clear()
-
-    # Update the chat history for display
-    history = history + [(transcript, assistant_response)]
-    return history
+    # Update the chat history for display (messages format) and reset the mic input
+    history = (history or []) + [
+        {"role": "user", "content": transcript},
+        {"role": "assistant", "content": assistant_response},
+    ]
+    return history, None
 
 def play_response(response):
     response_samples, response_rate = kokoro.create(
@@ -111,7 +116,7 @@ def create_interface():
     with gr.Blocks(title="Travel Agent Chatbot") as demo:
         gr.Markdown("# Travel Agent Chatbot")
         
-        chatbot = gr.Chatbot(label="Conversation")
+        chatbot = gr.Chatbot(label="Conversation", type="messages")
         
         with gr.Row():
             audio_input = gr.Audio(sources="microphone")
@@ -122,7 +127,7 @@ def create_interface():
         audio_input.change(
             fn=transcribe,
             inputs=[audio_input, chatbot],
-            outputs=[chatbot]
+            outputs=[chatbot, audio_input]
         )
         
         # Clear conversation history
