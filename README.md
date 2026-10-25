@@ -21,8 +21,8 @@ A voice-enabled conversational chatbot that acts as a Southern California travel
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/travel-agent-chatbot.git
-   cd travel-agent-chatbot
+   git clone https://github.com/bnarasimha21/travel-voice-assistant.git
+   cd travel-voice-assistant
    ```
 
 2. Install the required dependencies:
@@ -66,7 +66,7 @@ Click the "Clear Conversation" button to start a new conversation while preservi
 
 ## License
 
-[Your chosen license]
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file.
 
 ## Acknowledgments
 
