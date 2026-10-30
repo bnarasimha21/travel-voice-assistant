@@ -58,3 +58,8 @@ venv
 .venv
 audio_files/
 daily_reports/
+# Travel voice assistant
+models/
+logs/
+evals/recordings/
+evals/results/
