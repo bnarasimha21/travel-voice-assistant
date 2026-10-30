@@ -1,18 +1,26 @@
 """The FastRTC stream handler: one instance per browser connection.
 
-Audio arrives from the browser over WebRTC in `receive`, goes through VAD
-turn taking, and each finished turn runs STT -> LLM -> TTS. The reply audio
-is handed back to FastRTC in `emit`, which sends it to that browser. Nothing
-is played on the server.
+Audio arrives from the browser over WebRTC in `receive` and goes through VAD
+turn taking. Each finished turn starts a reply: STT, then the LLM streams
+tokens into a sentence chunker, and a TTS worker synthesizes each chunk while
+the LLM keeps generating. Reply audio is handed to FastRTC in `emit`, which
+sends it to that browser. Nothing is played on the server.
+
+Barge-in: if the visitor starts talking while a reply is active, the reply
+is cancelled (which closes the LLM HTTP stream), queued audio is dropped,
+and only the part of the reply the visitor actually heard is stored in the
+history, marked as interrupted. `emit` paces audio at real time, so the
+handler knows how much has been heard.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import numpy as np
@@ -20,7 +28,8 @@ from fastrtc import AdditionalOutputs, AsyncStreamHandler
 from fastrtc.utils import current_context
 
 from .audio import STT_SAMPLE_RATE, resample, to_mono_float32
-from .llm import LLMError
+from .chunker import SentenceChunker
+from .llm import LLMError, TextDelta
 from .prompts import LLM_FALLBACK_LINE, system_prompt
 from .session import Session, SessionStore
 from .turn import TurnDetector, TurnEnded, TurnTaker
@@ -45,16 +54,65 @@ class Backends:
     vad_threshold: float = 0.5
     min_speech_ms: float = 250
     max_turn_ms: float = 30000
+    barge_in: bool = True
+    barge_in_min_speech_ms: float = 300
+
+
+@dataclass
+class Segment:
+    """One synthesized chunk of the reply."""
+
+    text: str
+    samples: int
+
+
+@dataclass
+class Reply:
+    """Everything about the reply currently being produced and played."""
+
+    turn: TurnEnded
+    user: str = ""
+    text: str = ""  # all assistant text the LLM produced
+    segments: list[Segment] = field(default_factory=list)
+    emitted: int = 0  # samples handed to the transport
+    failed: bool = False
+    task: asyncio.Task | None = None
+    first_audio_at: float | None = None
+    llm_done_at: float | None = None
+
+    def spoken_text(self, heard_samples: int) -> str:
+        """The words covered by the first `heard_samples` of reply audio."""
+        words: list[str] = []
+        start = 0
+        for seg in self.segments:
+            end = start + seg.samples
+            if heard_samples >= end:
+                words.extend(seg.text.split())
+            elif heard_samples > start and seg.samples > 0:
+                seg_words = seg.text.split()
+                share = (heard_samples - start) / seg.samples
+                words.extend(seg_words[: int(len(seg_words) * share)])
+                break
+            else:
+                break
+            start = end
+        return " ".join(words)
 
 
 @dataclass
 class _Audio:
     samples: np.ndarray
+    reply: Reply
 
 
 @dataclass
 class _UI:
     outputs: AdditionalOutputs
+
+
+@dataclass
+class _End:
+    reply: Reply
 
 
 class VoiceHandler(AsyncStreamHandler):
@@ -75,9 +133,12 @@ class VoiceHandler(AsyncStreamHandler):
             min_speech_ms=backends.min_speech_ms,
             max_turn_ms=backends.max_turn_ms,
         )
-        self._out: asyncio.Queue[_Audio | _UI] = asyncio.Queue()
-        self._reply_task: asyncio.Task | None = None
+        self._out: asyncio.Queue[_Audio | _UI | _End] = asyncio.Queue()
+        self._current: Reply | None = None
+        self._carry: TurnEnded | None = None
         self._play_end = 0.0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self.barge_ins: list[float] = []  # perf_counter timestamps, for tests and logs
 
     # FastRTC interface -------------------------------------------------------
 
@@ -85,26 +146,37 @@ class VoiceHandler(AsyncStreamHandler):
         return VoiceHandler(self.backends, pace_output=self.pace_output)
 
     async def start_up(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self.bind_session()
 
     def shutdown(self) -> None:
-        self._cancel_reply()
+        self._stop_reply()
         if self.session is not None:
             self.backends.store.drop(self.session.id)
 
     async def receive(self, frame: tuple[int, np.ndarray]) -> None:
         self.bind_session()
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
         sample_rate, data = frame
         audio = to_mono_float32(data)
         if sample_rate != STT_SAMPLE_RATE:
             audio = resample(audio, sample_rate, STT_SAMPLE_RATE)
-        if self.is_replying:
-            # No barge-in yet: ignore the microphone while the agent answers.
+        if self._current is not None and not self.backends.barge_in:
+            # Barge-in disabled: ignore the microphone while the agent answers.
             self.turns.reset()
             return
         for event in await self.turns.feed(audio):
             if isinstance(event, TurnEnded):
+                if self._current is not None:
+                    self.barge_in()
                 self._start_reply(event)
+        if (
+            self._current is not None
+            and self.turns.in_speech
+            and self.turns.speech_ms >= self.backends.barge_in_min_speech_ms
+        ):
+            self.barge_in()
 
     async def emit(self):
         try:
@@ -113,7 +185,15 @@ class VoiceHandler(AsyncStreamHandler):
             return None
         if isinstance(item, _UI):
             return item.outputs
-        await self._pace(item.samples.size)
+        if isinstance(item, _End):
+            return self._finish_reply(item.reply)
+        if item.reply is not self._current:
+            return None  # left over from an interrupted reply
+        await self._wait_for_playback_slot()
+        if item.reply is not self._current:
+            return None  # interrupted while waiting: never send it
+        self._play_end += item.samples.size / self.output_sample_rate
+        item.reply.emitted += item.samples.size
         return (self.output_sample_rate, item.samples.reshape(1, -1))
 
     # Session -----------------------------------------------------------------
@@ -129,48 +209,131 @@ class VoiceHandler(AsyncStreamHandler):
         return self.session
 
     def _on_session_reset(self) -> None:
-        self._cancel_reply()
-        self._drain()
+        """Called by Session.reset, possibly from a Gradio worker thread."""
+        loop = self._loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            self._reset_now()
+        elif not loop.is_closed():
+            loop.call_soon_threadsafe(self._reset_now)
+
+    def _reset_now(self) -> None:
+        self._stop_reply()
+        self._carry = None
         self.turns.reset()
 
     # Reply -------------------------------------------------------------------
 
     @property
     def is_replying(self) -> bool:
-        busy = self._reply_task is not None and not self._reply_task.done()
-        return busy or any(isinstance(i, _Audio) for i in list(self._out._queue))  # type: ignore[attr-defined]
+        return self._current is not None
 
     def _start_reply(self, turn: TurnEnded) -> None:
-        self._reply_task = asyncio.create_task(self._reply(turn))
+        if self._carry is not None:
+            # The previous turn was cut off before any of its reply was heard:
+            # the visitor had not finished, so answer both parts together.
+            turn = _merge_turns(self._carry, turn)
+            self._carry = None
+        reply = Reply(turn=turn)
+        self._current = reply
+        reply.task = asyncio.create_task(self._reply(reply))
 
-    async def _reply(self, turn: TurnEnded) -> None:
+    async def _reply(self, reply: Reply) -> None:
         session = self.bind_session()
+        turn = reply.turn
         transcript = turn.transcript
         if transcript is None:
             transcript = (await self.backends.stt.transcribe(turn.audio)).strip()
         if not transcript:
+            self._out.put_nowait(_End(reply))
             return
+        reply.user = transcript
+        self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(pending_user=transcript))))
         messages = session.llm_messages(system_prompt(), transcript)
+
+        chunks: asyncio.Queue[str | None] = asyncio.Queue()
+        tts_task = asyncio.create_task(self._tts_worker(reply, chunks))
         try:
-            answer = await self.backends.llm.complete(messages)
-        except LLMError as exc:
-            log.warning("LLM call failed for session %s: %s", session.id, exc)
-            await self._speak(LLM_FALLBACK_LINE)
-            return
-        session.commit_turn(transcript, answer)
-        self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages())))
-        await self._speak(answer)
+            chunker = SentenceChunker()
+            try:
+                async with contextlib.aclosing(self.backends.llm.stream(messages)) as events:
+                    async for event in events:
+                        if isinstance(event, TextDelta):
+                            reply.text += event.text
+                            for chunk in chunker.push(event.text):
+                                chunks.put_nowait(chunk)
+                for chunk in chunker.flush():
+                    chunks.put_nowait(chunk)
+                reply.llm_done_at = time.perf_counter()
+            except LLMError as exc:
+                log.warning("LLM call failed for session %s: %s", session.id, exc)
+                reply.failed = True
+                chunks.put_nowait(LLM_FALLBACK_LINE)
+            chunks.put_nowait(None)
+            await tts_task
+        finally:
+            tts_task.cancel()
+        self._out.put_nowait(_End(reply))
 
-    async def _speak(self, text: str) -> None:
-        audio = await self.backends.tts.synthesize(text)
+    async def _tts_worker(self, reply: Reply, chunks: asyncio.Queue[str | None]) -> None:
         frame = int(self.output_sample_rate * FRAME_MS / 1000)
-        for start in range(0, audio.size, frame):
-            self._out.put_nowait(_Audio(audio[start : start + frame].astype(np.float32)))
+        while True:
+            text = await chunks.get()
+            if text is None:
+                return
+            audio = np.asarray(await self.backends.tts.synthesize(text), dtype=np.float32)
+            reply.segments.append(Segment(text, audio.size))
+            for start in range(0, audio.size, frame):
+                self._out.put_nowait(_Audio(audio[start : start + frame], reply))
+            if reply.first_audio_at is None:
+                reply.first_audio_at = time.perf_counter()
+                log.info(
+                    "first audio %.0f ms after end of speech; LLM still generating: %s",
+                    (reply.first_audio_at - reply.turn.speech_end_at) * 1000,
+                    reply.llm_done_at is None,
+                )
 
-    def _cancel_reply(self) -> None:
-        if self._reply_task is not None and not self._reply_task.done():
-            self._reply_task.cancel()
-        self._reply_task = None
+    def _finish_reply(self, reply: Reply) -> AdditionalOutputs | None:
+        """The last frame of the reply has been handed out: commit it."""
+        if reply is not self._current:
+            return None
+        self._current = None
+        session = self.bind_session()
+        if not reply.user:
+            return None
+        if not reply.failed:
+            session.commit_turn(reply.user, reply.text.strip())
+        return AdditionalOutputs(session.chat_messages())
+
+    def barge_in(self) -> None:
+        """The visitor talked over the reply: stop it and keep only what was heard."""
+        reply = self._current
+        if reply is None:
+            return
+        self.barge_ins.append(time.perf_counter())
+        heard = max(0, reply.emitted - int(round(self.unplayed_seconds() * self.output_sample_rate)))
+        self._stop_reply()
+        session = self.bind_session()
+        if heard == 0:
+            # Nothing of the reply was heard: the visitor was still talking.
+            self._carry = reply.turn
+            log.info("session %s: speech resumed before the reply was heard; merging turns", session.id)
+            return
+        if reply.user and not reply.failed:
+            spoken = reply.spoken_text(heard)
+            session.commit_turn(reply.user, spoken, interrupted=True)
+            self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages())))
+        log.info("session %s: barge-in after %.2f s of reply audio", session.id, heard / self.output_sample_rate)
+
+    def _stop_reply(self) -> None:
+        reply, self._current = self._current, None
+        if reply is not None and reply.task is not None and not reply.task.done():
+            reply.task.cancel()
+        self._drain()
+        self._play_end = time.perf_counter()
 
     def _drain(self) -> None:
         while not self._out.empty():
@@ -180,7 +343,7 @@ class VoiceHandler(AsyncStreamHandler):
 
     # Playback pacing ---------------------------------------------------------
 
-    async def _pace(self, n_samples: int) -> None:
+    async def _wait_for_playback_slot(self) -> None:
         """Hand frames to FastRTC at real time plus a small lead, so the server
         always knows how much of the reply the visitor has actually heard."""
         now = time.perf_counter()
@@ -190,8 +353,20 @@ class VoiceHandler(AsyncStreamHandler):
             wait = self._play_end - PLAYBACK_LEAD_S - now
             if wait > 0:
                 await asyncio.sleep(wait)
-        self._play_end += n_samples / self.output_sample_rate
 
     def unplayed_seconds(self) -> float:
         """Audio already handed to the transport that has not been heard yet."""
         return max(0.0, self._play_end - time.perf_counter()) if self.pace_output else 0.0
+
+
+def _merge_turns(first: TurnEnded, second: TurnEnded) -> TurnEnded:
+    transcript = None
+    if first.transcript is not None or second.transcript is not None:
+        transcript = " ".join(t for t in (first.transcript, second.transcript) if t)
+    return TurnEnded(
+        audio=np.concatenate([first.audio, second.audio]),
+        speech_ms=first.speech_ms + second.speech_ms,
+        speech_end_at=second.speech_end_at,
+        end_of_turn_delay_ms=second.end_of_turn_delay_ms,
+        transcript=transcript,
+    )

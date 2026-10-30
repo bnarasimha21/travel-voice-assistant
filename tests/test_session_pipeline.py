@@ -31,8 +31,13 @@ def spoken(text: str, rate: int = 16000) -> np.ndarray:
 
 
 def heard(driver) -> str:
-    """What a visitor would hear, decoded back to text."""
-    return CODEC.decode(driver.audio_samples(), driver.audio[0].sample_rate) if driver.audio else ""
+    """What a visitor would hear, decoded back to text (spaces dropped: chunk joins carry no gap)."""
+    text = CODEC.decode(driver.audio_samples(), driver.audio[0].sample_rate) if driver.audio else ""
+    return squash(text)
+
+
+def squash(text: str) -> str:
+    return "".join(CODEC.normalise(text).split())
 
 
 async def test_wav_question_gets_spoken_reply_in_same_session(make_backends, drivers, stub, tmp_path):
@@ -52,7 +57,7 @@ async def test_wav_question_gets_spoken_reply_in_same_session(make_backends, dri
     assert len(session.turns) == 1
     assert session.turns[0].assistant == f"Happy to help with that. You asked: {question}"
     assert {a.sample_rate for a in driver.audio} == {24000}
-    assert heard(driver) == CODEC.normalise(session.turns[0].assistant)
+    assert heard(driver) == squash(session.turns[0].assistant)
     # The chat panel got the transcript.
     assert driver.ui and driver.ui[-1].args[0][-1]["role"] == "assistant"
     # The LLM saw the system prompt and the question.
@@ -103,7 +108,7 @@ async def test_llm_error_speaks_fallback_and_keeps_history(make_backends, driver
     await driver.wait_idle()
 
     assert backends.store.peek("visitor-a").turns == []
-    assert heard(driver) == CODEC.normalise(LLM_FALLBACK_LINE)
+    assert heard(driver) == squash(LLM_FALLBACK_LINE)
     # The next turn works and does not carry an orphan user message.
     stub.brain = travel_brain
     await driver.say(spoken("hello, are you there?"))

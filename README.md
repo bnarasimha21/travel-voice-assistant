@@ -32,6 +32,34 @@ browser speaker <--WebRTC-- VoiceHandler.emit <------+
   assistant turn are added together. If the LLM call fails, you hear a short
   apology and the history is left as it was.
 
+### Streaming and barge-in
+
+The LLM reply is streamed. `voice_agent/chunker.py` cuts the token stream
+into speakable chunks (a sentence end, a clause boundary once there are
+enough words, or a hard word limit; it knows "St.", "Dr.", initials and
+"3.5" are not sentence ends), and a TTS worker synthesizes each chunk while
+the LLM keeps generating. The first sentence is playing before the model has
+finished. The log line `first audio N ms after end of speech; LLM still
+generating: True` shows it per turn.
+
+Talk over the agent and it stops: the LLM stream is cancelled (the HTTP
+request is closed, so the endpoint stops generating), queued audio is
+dropped, and FastRTC's send buffer is cleared. Audio is handed to the
+transport at real time, so the server knows how much of the reply you heard;
+only those words go into the history, marked `[interrupted by the user]`, so
+the model does not assume you heard the rest. If you start talking again
+before any of the reply was heard (you had only paused), the two parts are
+answered together as one turn.
+
+Barge-in depends on the browser's echo cancellation (on by default) so the
+agent does not hear itself; with loud speakers and no echo cancellation, use
+headphones or set `BARGE_IN=false`. `BARGE_IN_MIN_SPEECH_MS` sets how long
+you must talk before it counts as an interruption.
+
+Kokoro synthesizes one chunk per call. Its `create_stream` helper splits
+text into sentences itself, which the chunker already does, so it is not
+used.
+
 ### Why a custom FastRTC handler
 
 FastRTC ships a `ReplyOnPause` handler. This project uses its own
@@ -100,6 +128,7 @@ See `.env.example` for every setting and its default.
 | `STT_BACKEND`, `STT_MODEL` | `transformers` with a Whisper model id |
 | `TTS_BACKEND`, `TTS_MODEL_PATH`, `TTS_VOICES_PATH`, `TTS_VOICE` | Kokoro files and voice |
 | `VAD_BACKEND`, `SILENCE_MS`, `MIN_SPEECH_MS` | Turn taking |
+| `BARGE_IN`, `BARGE_IN_MIN_SPEECH_MS` | Talking over the agent |
 | `SERVER_NAME`, `SERVER_PORT`, `SHARE`, `TURN_SERVER` | Web server |
 
 ## Tests

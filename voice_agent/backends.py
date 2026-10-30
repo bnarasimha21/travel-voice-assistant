@@ -81,4 +81,6 @@ def build_backends(settings: Settings, *, stt=None, tts=None, llm=None, store: S
         vad_threshold=settings.vad_threshold,
         min_speech_ms=settings.min_speech_ms,
         max_turn_ms=settings.max_turn_s * 1000,
+        barge_in=settings.barge_in,
+        barge_in_min_speech_ms=settings.barge_in_min_speech_ms,
     )

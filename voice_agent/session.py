@@ -65,8 +65,11 @@ class Session:
 
     # Display -----------------------------------------------------------------
 
-    def chat_messages(self) -> list[dict[str, Any]]:
-        """Messages for the Gradio chatbot (type="messages"), tool activity included."""
+    def chat_messages(self, pending_user: str | None = None) -> list[dict[str, Any]]:
+        """Messages for the Gradio chatbot (type="messages"), tool activity included.
+
+        `pending_user` shows what the visitor just said before the reply is committed.
+        """
         with self._lock:
             turns = list(self.turns)
         out: list[dict[str, Any]] = []
@@ -77,6 +80,8 @@ class Session:
             if turn.interrupted:
                 text = f"{text} ... (interrupted)"
             out.append({"role": "assistant", "content": text})
+        if pending_user:
+            out.append({"role": "user", "content": pending_user})
         return out
 
     # Reset -------------------------------------------------------------------

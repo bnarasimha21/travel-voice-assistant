@@ -75,6 +75,8 @@ class Settings:
     silence_ms: int = 700
     min_speech_ms: int = 250
     max_turn_s: float = 30.0
+    barge_in: bool = True
+    barge_in_min_speech_ms: int = 300
 
     # Web server.
     server_name: str = "127.0.0.1"
