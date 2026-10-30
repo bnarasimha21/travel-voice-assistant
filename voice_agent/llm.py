@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -149,3 +151,65 @@ class OpenAICompatibleLLM:
         elif not "".join(text).strip():
             raise LLMError("empty completion")
         yield Done(finish)
+
+
+# Tool loop ---------------------------------------------------------------------
+
+
+@dataclass
+class ToolStarted:
+    call: ToolCall
+
+
+@dataclass
+class ToolFinished:
+    call: ToolCall
+    result: Any  # tools.ToolResult
+    messages: list[dict[str, Any]]  # complete assistant tool_calls message + tool results, once per round
+
+
+AgentEvent = TextDelta | ToolStarted | ToolFinished
+
+
+async def stream_with_tools(
+    llm: Any,
+    messages: list[dict[str, Any]],
+    registry: Any = None,
+    max_rounds: int = 4,
+) -> AsyncIterator[AgentEvent]:
+    """Stream a reply, running tool calls between model rounds.
+
+    Each round streams text deltas. If the round ends with tool calls, every
+    call is announced (ToolStarted), run concurrently with the registry's
+    per-call timeout, and reported (ToolFinished; the last event of a round
+    carries the assistant and tool messages to keep in history). Then the
+    model is called again with the results. The final round is sent without
+    tools so the model has to answer in words.
+    """
+    convo = list(messages)
+    for round_index in range(max_rounds):
+        tools = registry.openai_schemas() if registry and round_index < max_rounds - 1 else None
+        requested: ToolCalls | None = None
+        async with contextlib.aclosing(llm.stream(convo, tools)) as events:
+            async for event in events:
+                if isinstance(event, TextDelta):
+                    yield event
+                elif isinstance(event, ToolCalls):
+                    requested = event
+        if requested is None:
+            return
+        assistant = {
+            "role": "assistant",
+            "content": requested.text or None,
+            "tool_calls": [c.as_message_entry() for c in requested.calls],
+        }
+        for call in requested.calls:
+            yield ToolStarted(call)
+        results = await asyncio.gather(*(registry.run(c.name, c.arguments) for c in requested.calls))
+        round_messages = [assistant] + [
+            {"role": "tool", "tool_call_id": c.id, "content": r.content} for c, r in zip(requested.calls, results)
+        ]
+        convo.extend(round_messages)
+        for i, (call, result) in enumerate(zip(requested.calls, results)):
+            yield ToolFinished(call, result, round_messages if i == len(results) - 1 else [])
+    raise LLMError(f"no answer after {max_rounds} model rounds")

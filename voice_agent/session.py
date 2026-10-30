@@ -65,7 +65,9 @@ class Session:
 
     # Display -----------------------------------------------------------------
 
-    def chat_messages(self, pending_user: str | None = None) -> list[dict[str, Any]]:
+    def chat_messages(
+        self, pending_user: str | None = None, pending_tools: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
         """Messages for the Gradio chatbot (type="messages"), tool activity included.
 
         `pending_user` shows what the visitor just said before the reply is committed.
@@ -82,6 +84,7 @@ class Session:
             out.append({"role": "assistant", "content": text})
         if pending_user:
             out.append({"role": "user", "content": pending_user})
+            out.extend(_tool_display(pending_tools or []))
         return out
 
     # Reset -------------------------------------------------------------------

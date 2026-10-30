@@ -17,6 +17,9 @@ FAKE_ENV = {
     "VAD_BACKEND": "energy",
     "LLM_MODEL": "stub-model",
     "LLM_API_KEY": "test",
+    "WEATHER_PROVIDER": "fixture",
+    "FLIGHTS_PROVIDER": "fixture",
+    "HOTELS_PROVIDER": "fixture",
 }
 
 

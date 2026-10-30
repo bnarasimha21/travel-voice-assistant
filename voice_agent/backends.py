@@ -68,8 +68,12 @@ def turn_detector_factory(settings: Settings):
     return make
 
 
-def build_backends(settings: Settings, *, stt=None, tts=None, llm=None, store: SessionStore | None = None) -> Backends:
-    """Load every model once. Explicit stt/tts/llm arguments replace the configured ones."""
+def build_backends(
+    settings: Settings, *, stt=None, tts=None, llm=None, store: SessionStore | None = None, tools=None
+) -> Backends:
+    """Load every model once. Explicit stt/tts/llm/tools arguments replace the configured ones."""
+    from .tools import build_registry
+
     make_vad = vad_factory(settings)
     return Backends(
         stt=stt or build_stt(settings),
@@ -83,4 +87,7 @@ def build_backends(settings: Settings, *, stt=None, tts=None, llm=None, store: S
         max_turn_ms=settings.max_turn_s * 1000,
         barge_in=settings.barge_in,
         barge_in_min_speech_ms=settings.barge_in_min_speech_ms,
+        tools=tools if tools is not None else build_registry(settings),
+        max_tool_rounds=settings.max_tool_rounds,
+        filler_after_ms=settings.filler_after_ms,
     )

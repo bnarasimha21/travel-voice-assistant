@@ -8,6 +8,7 @@ server sends back. Each connection gets its own `VoiceHandler` (FastRTC calls
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from typing import Any
@@ -88,6 +89,9 @@ def main(argv: list[str] | None = None) -> None:
 
         log.info("Loading models (STT=%s, TTS=%s, LLM=%s)", settings.stt_backend, settings.tts_backend, settings.llm_model)
         backends = build_backends(settings)
+        if backends.tools:
+            log.info("Tools: %s", ", ".join(backends.tools.names()))
+            asyncio.run(backends.warm_fillers())
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

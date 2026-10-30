@@ -1,0 +1,39 @@
+{
+  "_note": "Offline sample hotels. Prices are per night for one room.",
+  "cities": {
+    "san diego": [
+      {"name": "Hotel del Coronado", "area": "Coronado", "price_per_night": 459, "currency": "USD", "rating": 4.5},
+      {"name": "The Sofia Hotel", "area": "Downtown", "price_per_night": 219, "currency": "USD", "rating": 4.0},
+      {"name": "Pacific Terrace Hotel", "area": "Pacific Beach", "price_per_night": 289, "currency": "USD", "rating": 4.5}
+    ],
+    "los angeles": [
+      {"name": "The Hollywood Roosevelt", "area": "Hollywood", "price_per_night": 329, "currency": "USD", "rating": 4.0},
+      {"name": "Hotel Erwin", "area": "Venice Beach", "price_per_night": 279, "currency": "USD", "rating": 4.5},
+      {"name": "Freehand Los Angeles", "area": "Downtown", "price_per_night": 189, "currency": "USD", "rating": 4.0}
+    ],
+    "san francisco": [
+      {"name": "Hotel Zephyr", "area": "Fisherman's Wharf", "price_per_night": 239, "currency": "USD", "rating": 4.0},
+      {"name": "Hotel Zetta", "area": "SoMa", "price_per_night": 259, "currency": "USD", "rating": 4.5}
+    ],
+    "palm springs": [
+      {"name": "Ace Hotel and Swim Club", "area": "South Palm Canyon", "price_per_night": 249, "currency": "USD", "rating": 4.0},
+      {"name": "Korakia Pensione", "area": "Tennis Club", "price_per_night": 395, "currency": "USD", "rating": 4.5}
+    ],
+    "santa barbara": [
+      {"name": "Hotel Californian", "area": "Funk Zone", "price_per_night": 499, "currency": "USD", "rating": 4.5},
+      {"name": "Agave Inn", "area": "Upper State Street", "price_per_night": 179, "currency": "USD", "rating": 3.5}
+    ],
+    "anaheim": [
+      {"name": "Disneyland Hotel", "area": "Disneyland Resort", "price_per_night": 549, "currency": "USD", "rating": 4.5},
+      {"name": "Courtyard Anaheim Theme Park Entrance", "area": "Harbor Boulevard", "price_per_night": 229, "currency": "USD", "rating": 4.0}
+    ],
+    "las vegas": [
+      {"name": "Bellagio", "area": "The Strip", "price_per_night": 289, "currency": "USD", "rating": 4.5},
+      {"name": "Golden Nugget", "area": "Downtown", "price_per_night": 129, "currency": "USD", "rating": 4.0}
+    ],
+    "new york": [
+      {"name": "The Standard High Line", "area": "Meatpacking District", "price_per_night": 399, "currency": "USD", "rating": 4.5},
+      {"name": "Pod 51", "area": "Midtown East", "price_per_night": 149, "currency": "USD", "rating": 3.5}
+    ]
+  }
+}

@@ -5,10 +5,12 @@ press the microphone and talk; pause when you are done and it answers out
 loud in your browser.
 
 Audio travels between the browser and the server over WebRTC
-([FastRTC](https://fastrtc.org)). Each turn runs speech to text, an LLM and
-text to speech. The defaults are free and run locally: Whisper for speech
+([FastRTC](https://github.com/gradio-app/fastrtc)). Each turn runs speech to text, an LLM and
+text to speech, and the model can look up weather, flights and hotels while
+you talk. The defaults are free and run locally: Whisper for speech
 recognition and Kokoro for the voice. The LLM is any OpenAI-compatible chat
-completions endpoint.
+completions endpoint with tool calling (DigitalOcean serverless inference by
+default).
 
 ## How it works
 
@@ -59,6 +61,61 @@ you must talk before it counts as an interruption.
 Kokoro synthesizes one chunk per call. Its `create_stream` helper splits
 text into sentences itself, which the chunker already does, so it is not
 used.
+
+### Travel tools
+
+The model can call three tools mid-conversation (`voice_agent/tools/`):
+
+| Tool | Default data | Live option |
+| --- | --- | --- |
+| `get_weather` | [Open-Meteo](https://open-meteo.com) forecast and geocoding (free, no key) | (already live) |
+| `search_flights` | Sample schedules in `voice_agent/tools/fixtures/flights.json` | [Duffel](https://duffel.com/docs/api/v2/offer-requests) offer requests, `FLIGHTS_PROVIDER=duffel` |
+| `search_hotels` | Sample hotels in `voice_agent/tools/fixtures/hotels.json` | [Duffel Stays](https://duffel.com/docs/guides/getting-started-with-stays) search, `HOTELS_PROVIDER=duffel` |
+
+Live flight and hotel APIs are paid or gated (Amadeus closed its free
+self-service API in 2026), so the sample data keeps the demo runnable with
+no keys, and the `FlightProvider` and `HotelProvider` interfaces keep the
+vendor choice open. Answers built from sample data are labelled
+`"source": "sample data"` in the tool result. Set `WEATHER_PROVIDER=fixture`
+to run fully offline.
+
+The tool loop (`stream_with_tools` in `voice_agent/llm.py`) streams a model
+round; if it ends in tool calls, they run concurrently with a per-call
+timeout (`TOOL_TIMEOUT_S`), their results go back as `tool` messages and the
+model is called again. If a call is still running after `FILLER_AFTER_MS`
+(300 ms) and nothing has been said yet, the agent says a short line such as
+"Let me look up flights for you." Those lines are synthesized once and
+cached, and fast calls never trigger one. A tool error or timeout produces
+a fixed spoken apology, then the model continues with the error in front of
+it. Tool calls and results appear in the chat panel as collapsible entries
+and stay in the session history, so a follow-up like "book the cheaper one"
+has the data.
+
+### Which LLM endpoint (DigitalOcean finding)
+
+The original app called a DigitalOcean Gradient agent endpoint. Its
+[Agent Inference API reference](https://docs.digitalocean.com/reference/api/reference/agent-inference/)
+lists `tools` and `tool_choice` in the request schema, but nothing in the
+docs says tools sent by the caller are run, streamed back as `tool_calls`,
+or left for the caller to run. The agent how-to examples send only
+`messages`, and agent tools are configured on the DigitalOcean side as
+[function routes backed by DigitalOcean Functions](https://docs.digitalocean.com/products/inference/how-to/route-agent-functions/),
+whose results come back as `functions.called_functions`. So caller-side tool
+calling against an agent endpoint is not documented, and this repo does not
+rely on it. (Not tested against a live agent: no key was used while writing
+this.)
+
+The default is therefore
+[DigitalOcean serverless inference](https://docs.digitalocean.com/products/inference/how-to/use-chat-completions-api/)
+at `https://inference.do-ai.run/v1` with a model access key. Its
+[API reference](https://docs.digitalocean.com/products/inference/reference/api/serverless-inference/)
+documents `tools`, `tool_choice`, streaming and `tool_calls`. The default
+model is `openai-gpt-5.6-luna`; any model marked as supporting tool calling
+on the
+[foundation models page](https://docs.digitalocean.com/products/inference/details/foundation-models/)
+works. Any other OpenAI-compatible endpoint with tool calling (OpenAI,
+vLLM, Ollama) works the same way. To keep using an agent endpoint, set its
+URL, `LLM_EXTRA_QUERY=agent=true` and `TOOLS=none`.
 
 ### Why a custom FastRTC handler
 
@@ -114,7 +171,7 @@ microphone on `localhost` or HTTPS, so for other machines use `SHARE=true`
 (a Gradio share link) or put it behind HTTPS. Visitors behind strict NATs
 need a TURN server: set `TURN_SERVER` to `hf`, `cloudflare` or `twilio` and
 the matching credentials (see the
-[FastRTC deployment guide](https://fastrtc.org/deployment/)).
+[FastRTC deployment guide](https://github.com/gradio-app/fastrtc/blob/main/docs/deployment.md)).
 
 ## Configuration
 
@@ -125,6 +182,8 @@ See `.env.example` for every setting and its default.
 | --- | --- |
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | The OpenAI-compatible endpoint, model and key |
 | `LLM_EXTRA_QUERY` | Extra query string for every LLM call, for example `agent=true` |
+| `TOOLS`, `TOOL_TIMEOUT_S`, `FILLER_AFTER_MS` | Which tools the model gets, per-call timeout, filler delay |
+| `WEATHER_PROVIDER`, `FLIGHTS_PROVIDER`, `HOTELS_PROVIDER`, `DUFFEL_API_KEY` | Tool data sources |
 | `STT_BACKEND`, `STT_MODEL` | `transformers` with a Whisper model id |
 | `TTS_BACKEND`, `TTS_MODEL_PATH`, `TTS_VOICES_PATH`, `TTS_VOICE` | Kokoro files and voice |
 | `VAD_BACKEND`, `SILENCE_MS`, `MIN_SPEECH_MS` | Turn taking |
@@ -149,7 +208,9 @@ pushing 20 ms microphone frames into `receive` and pulling reply audio out of
 
 Tests marked `realmodels` use real Whisper (tiny), Kokoro and Silero and are
 skipped when the files are not on disk. Run only them with
-`pytest -m realmodels`.
+`pytest -m realmodels`. `tests/test_tools_live.py` checks that the real
+configured model picks `get_weather` for a weather question; it runs only
+with `RUN_LIVE_LLM=1` and LLM credentials set.
 
 ## Screenshot
 

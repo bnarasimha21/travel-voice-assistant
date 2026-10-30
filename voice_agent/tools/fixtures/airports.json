@@ -1,0 +1,13 @@
+{
+  "codes": {
+    "LAX": "Los Angeles", "SFO": "San Francisco", "SAN": "San Diego", "SJC": "San Jose",
+    "OAK": "Oakland", "SNA": "Santa Ana", "BUR": "Burbank", "PSP": "Palm Springs",
+    "SBA": "Santa Barbara", "LAS": "Las Vegas", "JFK": "New York", "SEA": "Seattle"
+  },
+  "cities": {
+    "los angeles": "LAX", "la": "LAX", "san francisco": "SFO", "sf": "SFO", "san diego": "SAN",
+    "san jose": "SJC", "oakland": "OAK", "orange county": "SNA", "santa ana": "SNA", "anaheim": "SNA",
+    "burbank": "BUR", "palm springs": "PSP", "santa barbara": "SBA", "las vegas": "LAS", "vegas": "LAS",
+    "new york": "JFK", "new york city": "JFK", "seattle": "SEA"
+  }
+}

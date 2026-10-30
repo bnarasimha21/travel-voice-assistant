@@ -1,0 +1,47 @@
+{
+  "_note": "Offline sample schedules. Times are local. Prices are per adult, economy, one way.",
+  "routes": {
+    "LAX-SFO": [
+      {"airline": "United Airlines", "flight_number": "UA 1523", "depart_time": "07:05", "arrive_time": "08:35", "duration_min": 90, "stops": 0, "price": 129, "currency": "USD"},
+      {"airline": "Alaska Airlines", "flight_number": "AS 1341", "depart_time": "09:40", "arrive_time": "11:05", "duration_min": 85, "stops": 0, "price": 109, "currency": "USD"},
+      {"airline": "Southwest Airlines", "flight_number": "WN 2287", "depart_time": "17:15", "arrive_time": "18:45", "duration_min": 90, "stops": 0, "price": 98, "currency": "USD"}
+    ],
+    "SFO-LAX": [
+      {"airline": "United Airlines", "flight_number": "UA 1844", "depart_time": "08:00", "arrive_time": "09:30", "duration_min": 90, "stops": 0, "price": 134, "currency": "USD"},
+      {"airline": "Delta Air Lines", "flight_number": "DL 2611", "depart_time": "12:20", "arrive_time": "13:50", "duration_min": 90, "stops": 0, "price": 119, "currency": "USD"}
+    ],
+    "LAX-SAN": [
+      {"airline": "United Airlines", "flight_number": "UA 5650", "depart_time": "10:10", "arrive_time": "11:00", "duration_min": 50, "stops": 0, "price": 89, "currency": "USD"}
+    ],
+    "SAN-LAX": [
+      {"airline": "United Airlines", "flight_number": "UA 5651", "depart_time": "12:15", "arrive_time": "13:10", "duration_min": 55, "stops": 0, "price": 92, "currency": "USD"}
+    ],
+    "SFO-SAN": [
+      {"airline": "Alaska Airlines", "flight_number": "AS 1964", "depart_time": "06:45", "arrive_time": "08:20", "duration_min": 95, "stops": 0, "price": 117, "currency": "USD"},
+      {"airline": "Southwest Airlines", "flight_number": "WN 1210", "depart_time": "14:30", "arrive_time": "16:05", "duration_min": 95, "stops": 0, "price": 104, "currency": "USD"}
+    ],
+    "SAN-SFO": [
+      {"airline": "Alaska Airlines", "flight_number": "AS 1965", "depart_time": "09:05", "arrive_time": "10:45", "duration_min": 100, "stops": 0, "price": 121, "currency": "USD"}
+    ],
+    "LAX-LAS": [
+      {"airline": "Southwest Airlines", "flight_number": "WN 1420", "depart_time": "08:30", "arrive_time": "09:40", "duration_min": 70, "stops": 0, "price": 79, "currency": "USD"},
+      {"airline": "Spirit Airlines", "flight_number": "NK 1102", "depart_time": "19:55", "arrive_time": "21:05", "duration_min": 70, "stops": 0, "price": 49, "currency": "USD"}
+    ],
+    "LAS-LAX": [
+      {"airline": "Southwest Airlines", "flight_number": "WN 1421", "depart_time": "10:20", "arrive_time": "11:35", "duration_min": 75, "stops": 0, "price": 84, "currency": "USD"}
+    ],
+    "LAX-JFK": [
+      {"airline": "JetBlue", "flight_number": "B6 24", "depart_time": "07:00", "arrive_time": "15:25", "duration_min": 325, "stops": 0, "price": 249, "currency": "USD"},
+      {"airline": "Delta Air Lines", "flight_number": "DL 917", "depart_time": "22:30", "arrive_time": "06:59", "duration_min": 329, "stops": 0, "price": 279, "currency": "USD"}
+    ],
+    "JFK-LAX": [
+      {"airline": "JetBlue", "flight_number": "B6 23", "depart_time": "08:00", "arrive_time": "11:20", "duration_min": 380, "stops": 0, "price": 239, "currency": "USD"}
+    ],
+    "LAX-PSP": [
+      {"airline": "Alaska Airlines", "flight_number": "AS 3438", "depart_time": "13:10", "arrive_time": "14:05", "duration_min": 55, "stops": 0, "price": 139, "currency": "USD"}
+    ],
+    "SFO-PSP": [
+      {"airline": "United Airlines", "flight_number": "UA 5402", "depart_time": "11:00", "arrive_time": "12:40", "duration_min": 100, "stops": 0, "price": 159, "currency": "USD"}
+    ]
+  }
+}

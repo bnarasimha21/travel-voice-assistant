@@ -29,7 +29,7 @@ from fastrtc.utils import current_context
 
 from .audio import STT_SAMPLE_RATE, resample, to_mono_float32
 from .chunker import SentenceChunker
-from .llm import LLMError, TextDelta
+from .llm import LLMError, TextDelta, ToolFinished, ToolStarted, stream_with_tools
 from .prompts import LLM_FALLBACK_LINE, system_prompt
 from .session import Session, SessionStore
 from .turn import TurnDetector, TurnEnded, TurnTaker
@@ -56,6 +56,22 @@ class Backends:
     max_turn_ms: float = 30000
     barge_in: bool = True
     barge_in_min_speech_ms: float = 300
+    tools: Any = None  # tools.ToolRegistry, or None for no tools
+    max_tool_rounds: int = 4
+    filler_after_ms: float = 300
+    filler_cache: dict[str, np.ndarray] = field(default_factory=dict)
+
+    async def filler_audio(self, text: str) -> np.ndarray:
+        """Filler lines are synthesized once and reused, so they start instantly."""
+        audio = self.filler_cache.get(text)
+        if audio is None:
+            audio = np.asarray(await self.tts.synthesize(text), dtype=np.float32)
+            self.filler_cache[text] = audio
+        return audio
+
+    async def warm_fillers(self) -> None:
+        for tool in getattr(self.tools, "tools", None) or []:
+            await self.filler_audio(tool.filler)
 
 
 @dataclass
@@ -64,6 +80,7 @@ class Segment:
 
     text: str
     samples: int
+    filler: bool = False  # "let me check" lines are not part of the answer
 
 
 @dataclass
@@ -72,7 +89,10 @@ class Reply:
 
     turn: TurnEnded
     user: str = ""
-    text: str = ""  # all assistant text the LLM produced
+    text: str = ""  # assistant text since the last tool round (the answer to commit)
+    tool_messages: list[dict[str, Any]] = field(default_factory=list)  # complete tool rounds
+    pending_tools: list[Any] = field(default_factory=list)
+    filler_used: bool = False
     segments: list[Segment] = field(default_factory=list)
     emitted: int = 0  # samples handed to the transport
     failed: bool = False
@@ -86,15 +106,15 @@ class Reply:
         start = 0
         for seg in self.segments:
             end = start + seg.samples
-            if heard_samples >= end:
-                words.extend(seg.text.split())
-            elif heard_samples > start and seg.samples > 0:
-                seg_words = seg.text.split()
-                share = (heard_samples - start) / seg.samples
-                words.extend(seg_words[: int(len(seg_words) * share)])
+            if heard_samples <= start:
                 break
-            else:
-                break
+            if not seg.filler:
+                if heard_samples >= end:
+                    words.extend(seg.text.split())
+                elif seg.samples > 0:
+                    seg_words = seg.text.split()
+                    share = (heard_samples - start) / seg.samples
+                    words.extend(seg_words[: int(len(seg_words) * share)])
             start = end
         return " ".join(words)
 
@@ -113,6 +133,14 @@ class _UI:
 @dataclass
 class _End:
     reply: Reply
+
+
+@dataclass
+class _Prerendered:
+    """A chunk whose audio is already synthesized (filler lines)."""
+
+    text: str
+    audio: np.ndarray
 
 
 class VoiceHandler(AsyncStreamHandler):
@@ -252,19 +280,50 @@ class VoiceHandler(AsyncStreamHandler):
             return
         reply.user = transcript
         self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(pending_user=transcript))))
-        messages = session.llm_messages(system_prompt(), transcript)
+        messages = session.llm_messages(system_prompt(tools=bool(self.backends.tools)), transcript)
 
-        chunks: asyncio.Queue[str | None] = asyncio.Queue()
+        chunks: asyncio.Queue[str | _Prerendered | None] = asyncio.Queue()
         tts_task = asyncio.create_task(self._tts_worker(reply, chunks))
+        filler_task: asyncio.Task | None = None
         try:
             chunker = SentenceChunker()
+            spoke_this_round = False
             try:
-                async with contextlib.aclosing(self.backends.llm.stream(messages)) as events:
+                events = stream_with_tools(
+                    self.backends.llm, messages, self.backends.tools, self.backends.max_tool_rounds
+                )
+                async with contextlib.aclosing(events) as events:
                     async for event in events:
                         if isinstance(event, TextDelta):
                             reply.text += event.text
+                            spoke_this_round = spoke_this_round or bool(event.text.strip())
                             for chunk in chunker.push(event.text):
                                 chunks.put_nowait(chunk)
+                        elif isinstance(event, ToolStarted):
+                            # Say whatever came before the call first; that text is kept
+                            # in the tool round's assistant message, not in the answer.
+                            for chunk in chunker.flush():
+                                chunks.put_nowait(chunk)
+                            reply.text = ""
+                            reply.pending_tools.append(event.call)
+                            if filler_task is None and not reply.filler_used and not spoke_this_round:
+                                filler_task = asyncio.create_task(self._filler_after(reply, chunks, event.call.name))
+                            self._show(session, reply)
+                        elif isinstance(event, ToolFinished):
+                            reply.pending_tools = [c for c in reply.pending_tools if c.id != event.call.id]
+                            if not reply.pending_tools and filler_task is not None:
+                                filler_task.cancel()
+                                filler_task = None
+                            if not event.result.ok:
+                                tool = self.backends.tools.get(event.call.name)
+                                apology = tool.apology if tool else "Sorry, something went wrong with that lookup."
+                                chunks.put_nowait(apology)
+                                reply.text += apology + " "
+                                log.warning("tool %s failed: %s", event.call.name, event.result.data.get("error"))
+                            if event.messages:
+                                reply.tool_messages.extend(event.messages)
+                                spoke_this_round = False
+                                self._show(session, reply)
                 for chunk in chunker.flush():
                     chunks.put_nowait(chunk)
                 reply.llm_done_at = time.perf_counter()
@@ -276,16 +335,37 @@ class VoiceHandler(AsyncStreamHandler):
             await tts_task
         finally:
             tts_task.cancel()
+            if filler_task is not None:
+                filler_task.cancel()
         self._out.put_nowait(_End(reply))
 
-    async def _tts_worker(self, reply: Reply, chunks: asyncio.Queue[str | None]) -> None:
+    def _show(self, session: Session, reply: Reply) -> None:
+        """Update the chat panel with the turn in progress, tool calls included."""
+        chat = session.chat_messages(pending_user=reply.user, pending_tools=reply.tool_messages)
+        self._out.put_nowait(_UI(AdditionalOutputs(chat)))
+
+    async def _filler_after(self, reply: Reply, chunks: asyncio.Queue, tool_name: str) -> None:
+        """If the tool is still running after `filler_after_ms`, say a short line."""
+        await asyncio.sleep(self.backends.filler_after_ms / 1000)
+        tool = self.backends.tools.get(tool_name) if self.backends.tools else None
+        text = tool.filler if tool else "One moment."
+        audio = await self.backends.filler_audio(text)
+        if reply.pending_tools and not reply.filler_used:
+            reply.filler_used = True
+            chunks.put_nowait(_Prerendered(text, audio))
+
+    async def _tts_worker(self, reply: Reply, chunks: asyncio.Queue) -> None:
         frame = int(self.output_sample_rate * FRAME_MS / 1000)
         while True:
-            text = await chunks.get()
-            if text is None:
+            item = await chunks.get()
+            if item is None:
                 return
-            audio = np.asarray(await self.backends.tts.synthesize(text), dtype=np.float32)
-            reply.segments.append(Segment(text, audio.size))
+            if isinstance(item, _Prerendered):
+                text, audio, filler = item.text, item.audio, True
+            else:
+                text, filler = item, False
+                audio = np.asarray(await self.backends.tts.synthesize(text), dtype=np.float32)
+            reply.segments.append(Segment(text, audio.size, filler))
             for start in range(0, audio.size, frame):
                 self._out.put_nowait(_Audio(audio[start : start + frame], reply))
             if reply.first_audio_at is None:
@@ -305,7 +385,7 @@ class VoiceHandler(AsyncStreamHandler):
         if not reply.user:
             return None
         if not reply.failed:
-            session.commit_turn(reply.user, reply.text.strip())
+            session.commit_turn(reply.user, reply.text.strip(), tool_messages=reply.tool_messages)
         return AdditionalOutputs(session.chat_messages())
 
     def barge_in(self) -> None:
@@ -324,7 +404,7 @@ class VoiceHandler(AsyncStreamHandler):
             return
         if reply.user and not reply.failed:
             spoken = reply.spoken_text(heard)
-            session.commit_turn(reply.user, spoken, interrupted=True)
+            session.commit_turn(reply.user, spoken, interrupted=True, tool_messages=reply.tool_messages)
             self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages())))
         log.info("session %s: barge-in after %.2f s of reply audio", session.id, heard / self.output_sample_rate)
 

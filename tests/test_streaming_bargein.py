@@ -89,7 +89,7 @@ async def test_barge_in_stops_reply_and_keeps_only_spoken_text(make_backends, dr
 
     # The second reply answers the new utterance, and the model was told about the cut.
     assert second_turn.user == second and not second_turn.interrupted
-    sent = stub.requests[-1]["messages"]
+    sent = stub.requests[1]["messages"]
     assert sent[-1] == {"role": "user", "content": second}
     assert sent[-2]["role"] == "assistant" and sent[-2]["content"].endswith(INTERRUPTED_MARK)
 

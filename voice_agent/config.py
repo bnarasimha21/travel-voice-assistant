@@ -54,6 +54,19 @@ class Settings:
     llm_extra_query: str = ""
     llm_timeout_s: float = 30.0
 
+    # Travel tools.
+    tools: str = "weather,flights,hotels"
+    tool_timeout_s: float = 8.0
+    max_tool_rounds: int = 4
+    filler_after_ms: int = 300
+    weather_provider: str = "open-meteo"
+    flights_provider: str = "fixture"
+    hotels_provider: str = "fixture"
+    open_meteo_geocoding_url: str = ""
+    open_meteo_forecast_url: str = ""
+    duffel_api_key: str = ""
+    duffel_base_url: str = ""
+
     # Speech to text.
     stt_backend: str = ""
     stt_model: str = ""
