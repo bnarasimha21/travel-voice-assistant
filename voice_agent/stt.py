@@ -60,3 +60,38 @@ class TransformersWhisperSTT:
         if audio is None:
             return ""
         return await asyncio.to_thread(self._run, audio)
+
+
+class FasterWhisperSTT:
+    """Whisper through CTranslate2 (`faster-whisper`): int8 on the CPU, much less
+    latency than `transformers` for the same model size.
+
+    `model` is a size name (`tiny.en`, `base.en`, `small`, ...) or a Hugging Face
+    repo such as `Systran/faster-whisper-tiny`; it downloads on first use.
+    """
+
+    name = "faster-whisper"
+
+    def __init__(self, model: str, device: str = "auto", language: str = "en", compute_type: str = "default"):
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:  # pragma: no cover - depends on the environment
+            from .config import ConfigError
+
+            raise ConfigError("STT_BACKEND=faster-whisper needs `pip install faster-whisper`") from exc
+        self._model = WhisperModel(model, device=device, compute_type=compute_type)
+        self._language = language or None
+        self._lock = threading.Lock()
+
+    def _run(self, audio: np.ndarray) -> str:
+        with self._lock:
+            segments, _info = self._model.transcribe(
+                audio, language=self._language, beam_size=1, vad_filter=False, condition_on_previous_text=False
+            )
+            return " ".join(s.text.strip() for s in segments).strip()
+
+    async def transcribe(self, audio16k: np.ndarray) -> str:
+        audio = _normalise_peak(audio16k)
+        if audio is None:
+            return ""
+        return await asyncio.to_thread(self._run, audio)

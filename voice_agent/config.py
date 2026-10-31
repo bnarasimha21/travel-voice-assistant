@@ -44,7 +44,8 @@ def _as_query(value: str) -> dict[str, str]:
 class Settings:
     """All tunables. Field names map to upper-case env vars (`llm_model` -> `LLM_MODEL`)."""
 
-    # Which pipeline serves the browser.
+    # Which pipeline serves the browser: cascade (STT, LLM, TTS here) or s2s
+    # (a speech-to-speech realtime model, see voice_agent/realtime/).
     pipeline: str = "cascade"
 
     # LLM: any OpenAI-compatible chat completions endpoint.
@@ -72,6 +73,27 @@ class Settings:
     stt_model: str = ""
     stt_device: str = "auto"
     stt_language: str = "en"
+    stt_compute_type: str = "default"  # faster-whisper: int8, float16, ...
+
+    # Deepgram Flux (STT_BACKEND=deepgram-flux): streaming STT with end-of-turn detection.
+    deepgram_url: str = ""
+    deepgram_model: str = ""
+    deepgram_api_key: str = ""
+    deepgram_eot_threshold: float = 0.7
+    deepgram_eot_timeout_ms: int = 5000
+
+    # Speech to speech (PIPELINE=s2s).
+    s2s_provider: str = ""
+    openai_api_key: str = ""
+    openai_realtime_url: str = ""
+    openai_realtime_model: str = ""
+    openai_realtime_voice: str = ""
+    openai_realtime_transcribe_model: str = ""
+    openai_realtime_turn_detection: str = ""
+    gemini_api_key: str = ""
+    gemini_live_url: str = ""
+    gemini_live_model: str = ""
+    gemini_live_voice: str = ""
 
     # Text to speech.
     tts_backend: str = ""

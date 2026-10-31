@@ -2,8 +2,9 @@
 
 The page holds a FastRTC WebRTC component in send-receive audio mode: the
 browser streams the microphone to the server and plays the reply track the
-server sends back. Each connection gets its own `VoiceHandler` (FastRTC calls
-`handler.copy()` per connection) and its own `Session`.
+server sends back. Each connection gets its own handler (FastRTC calls
+`handler.copy()` per connection) and its own `Session`: a `VoiceHandler` for
+the cascade, or an `S2SHandler` for `PIPELINE=s2s`.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from fastrtc import WebRTC
 
 from .config import ConfigError, Settings, load_settings
 from .handler import Backends, VoiceHandler
+from .realtime.handler import S2SBackends, S2SHandler
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ def rtc_configuration(settings: Settings):
     return providers[kind]
 
 
-def clear_session(backends: Backends, webrtc_value: Any) -> list:
+def clear_session(backends: Backends | S2SBackends, webrtc_value: Any) -> list:
     """Reset only the caller's own session."""
     webrtc_id = getattr(webrtc_value, "webrtc_id", webrtc_value)
     if isinstance(webrtc_id, str) and webrtc_id:
@@ -50,8 +52,8 @@ def clear_session(backends: Backends, webrtc_value: Any) -> list:
     return []
 
 
-def build_ui(backends: Backends, settings: Settings) -> gr.Blocks:
-    handler = VoiceHandler(backends)
+def build_ui(backends: Backends | S2SBackends, settings: Settings) -> gr.Blocks:
+    handler = S2SHandler(backends) if isinstance(backends, S2SBackends) else VoiceHandler(backends)
     with gr.Blocks(title="Travel Voice Assistant") as demo:
         gr.Markdown(
             "# Travel Voice Assistant\n"
@@ -84,17 +86,30 @@ def build_ui(backends: Backends, settings: Settings) -> gr.Blocks:
     return demo
 
 
+def build_pipeline(settings: Settings) -> Backends | S2SBackends:
+    from .backends import build_backends, build_s2s_backends
+
+    if settings.pipeline == "s2s":
+        log.info("Speech to speech: %s", settings.s2s_provider)
+        backends = build_s2s_backends(settings)
+        if backends.tools:
+            log.info("Tools: %s", ", ".join(backends.tools.names()))
+        return backends
+    if settings.pipeline != "cascade":
+        raise ConfigError(f"Unknown PIPELINE={settings.pipeline!r} (expected cascade or s2s)")
+    log.info("Loading models (STT=%s %s, TTS=%s, LLM=%s)", settings.stt_backend, settings.stt_model, settings.tts_backend, settings.llm_model)
+    backends = build_backends(settings)
+    if backends.tools:
+        log.info("Tools: %s", ", ".join(backends.tools.names()))
+        asyncio.run(backends.warm_fillers())
+    return backends
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         settings = load_settings()
-        from .backends import build_backends
-
-        log.info("Loading models (STT=%s, TTS=%s, LLM=%s)", settings.stt_backend, settings.tts_backend, settings.llm_model)
-        backends = build_backends(settings)
-        if backends.tools:
-            log.info("Tools: %s", ", ".join(backends.tools.names()))
-            asyncio.run(backends.warm_fillers())
+        backends = build_pipeline(settings)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

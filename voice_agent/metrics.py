@@ -56,6 +56,9 @@ class TurnTimer:
     outcome: str | None = None
     turn_detector: str = ""
     record: dict[str, Any] | None = None
+    # False when a hosted model decided the turn without saying when (Gemini Live):
+    # turn_end is then null instead of a made-up number.
+    turn_end_known: bool = True
 
     def mark(self, stage: str, at: float | None = None) -> None:
         """Record a stage the first time it happens; later calls are ignored."""
@@ -68,7 +71,7 @@ class TurnTimer:
         if stage == "speech_end":
             return 0.0
         if stage == "turn_end":
-            return round(self.end_of_turn_delay_ms, 1)
+            return round(self.end_of_turn_delay_ms, 1) if self.turn_end_known else None
         at = self.marks.get(stage)
         if at is None:
             return None

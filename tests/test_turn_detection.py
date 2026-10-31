@@ -175,7 +175,7 @@ def test_pause_marks_in_scenarios(tmp_path):
     assert turn.text == "I want to fly to, um San Diego."
     assert turn.parts() == [("I want to fly to, um", 1.0), ("San Diego.", 0.0)]
     scenario = next(s for s in load_scenarios() if s.name == "mid_sentence_pause")
-    assert scenario.allow_early_cutoff == ["silence"] and scenario.turns[0].pauses == 1
+    assert scenario.allow_early_cutoff == ["silence", "gemini"] and scenario.turns[0].pauses == 1
     bad = tmp_path / "bad.yaml"
     bad.write_text("turns:\n  - say: hi [pause 1] there\n    audio: x.wav\n")
     with pytest.raises(ValueError, match="pause"):
@@ -193,7 +193,7 @@ async def test_eval_reports_early_cutoffs_per_detector():
     assert by[("mid_sentence_pause", "silence")].early_cutoffs == 1
     assert by[("mid_sentence_pause", "smart")].early_cutoffs == 0
     assert by[("weather_tool", "smart")].early_cutoffs == 0
-    detectors = report.summary()["detectors"]
+    detectors = report.summary()["configs"]
     assert detectors["silence"]["early_cutoffs"] == 1 and detectors["silence"]["scripted_turns"] == 2
     assert detectors["silence"]["early_cutoff_rate"] == 0.5
     assert detectors["smart"]["early_cutoff_rate"] == 0.0

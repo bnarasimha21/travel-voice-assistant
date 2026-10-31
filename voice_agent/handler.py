@@ -62,6 +62,9 @@ class Backends:
     filler_after_ms: float = 300
     filler_cache: dict[str, np.ndarray] = field(default_factory=dict)
     turn_log: TurnLog | None = None  # one JSON line per turn, or None to skip writing
+    # Streaming STT with its own turn taking (Deepgram Flux): replaces the local
+    # VAD turn taker, and its turns arrive with the transcript already done.
+    make_turn_source: Callable[[], Any] | None = None
 
     async def filler_audio(self, text: str) -> np.ndarray:
         """Filler lines are synthesized once and reused, so they start instantly."""
@@ -157,13 +160,17 @@ class VoiceHandler(AsyncStreamHandler):
         self.pace_output = pace_output
         self._session_id = session_id
         self.session: Session | None = None
-        self.turns = TurnTaker(
-            vad=backends.make_vad(),
-            detector=backends.make_turn_detector(),
-            threshold=backends.vad_threshold,
-            min_speech_ms=backends.min_speech_ms,
-            max_turn_ms=backends.max_turn_ms,
-        )
+        if backends.make_turn_source is not None:
+            self.turns = backends.make_turn_source()
+            self.turns.set_listener(self._on_turn_events)
+        else:
+            self.turns = TurnTaker(
+                vad=backends.make_vad(),
+                detector=backends.make_turn_detector(),
+                threshold=backends.vad_threshold,
+                min_speech_ms=backends.min_speech_ms,
+                max_turn_ms=backends.max_turn_ms,
+            )
         self._out: asyncio.Queue[_Audio | _UI | _End] = asyncio.Queue()
         self._current: Reply | None = None
         self._carry: TurnEnded | None = None
@@ -185,6 +192,9 @@ class VoiceHandler(AsyncStreamHandler):
         self._stop_reply()
         if self.session is not None:
             self.backends.store.drop(self.session.id)
+        aclose = getattr(self.turns, "aclose", None)
+        if aclose is not None:
+            self._run_soon(aclose())
 
     async def receive(self, frame: tuple[int, np.ndarray]) -> None:
         self.bind_session()
@@ -198,17 +208,39 @@ class VoiceHandler(AsyncStreamHandler):
             # Barge-in disabled: ignore the microphone while the agent answers.
             self.turns.reset()
             return
-        for event in await self.turns.feed(audio):
-            if isinstance(event, TurnEnded):
-                if self._current is not None:
-                    self.barge_in()
-                self._start_reply(event)
+        self._on_turn_events(await self.turns.feed(audio))
         if (
             self._current is not None
             and self.turns.in_speech
             and self.turns.speech_ms >= self.backends.barge_in_min_speech_ms
         ):
             self.barge_in()
+
+    def _on_turn_events(self, events: list) -> None:
+        """Turn events from the local turn taker (returned by `feed`) or a
+        streaming STT (pushed from its network reader)."""
+        for event in events:
+            if isinstance(event, TurnEnded):
+                if self._current is not None:
+                    if not self.backends.barge_in:
+                        continue  # a streaming STT finished a turn spoken over the reply
+                    self.barge_in()
+                self._start_reply(event)
+
+    def _run_soon(self, coro) -> None:
+        """Run a coroutine on the handler's loop from sync code (any thread)."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            coro.close()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            loop.create_task(coro)
+        else:
+            asyncio.run_coroutine_threadsafe(coro, loop)
 
     async def emit(self):
         try:

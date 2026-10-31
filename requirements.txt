@@ -15,3 +15,7 @@ torch>=2.2
 transformers>=4.46
 kokoro-onnx>=0.4
 onnxruntime>=1.18
+faster-whisper>=1.1  # STT_BACKEND=faster-whisper
+
+# Hosted streaming STT (Deepgram Flux) and speech-to-speech (PIPELINE=s2s)
+websockets>=14

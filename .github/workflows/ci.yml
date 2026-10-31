@@ -32,11 +32,11 @@ jobs:
           path: models
           key: kokoro-v1.0-int8-smart-turn-v3.2
 
-      - name: Cache Hugging Face models (Whisper tiny, Silero VAD)
+      - name: Cache Hugging Face models (Whisper tiny, faster-whisper tiny, Silero VAD)
         uses: actions/cache@v4
         with:
           path: .hf-cache
-          key: hf-whisper-tiny-silero-v1
+          key: hf-whisper-tiny-faster-whisper-tiny-silero-v2
 
       - name: Download models if not cached
         run: |
@@ -47,14 +47,16 @@ jobs:
           [ -f models/smart-turn-v3.2-cpu.onnx ] || curl -fsSL -o models/smart-turn-v3.2-cpu.onnx \
             https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx
           python -c "from huggingface_hub import snapshot_download; snapshot_download('openai/whisper-tiny')"
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-tiny')"
           python -c "from voice_agent.vad import warm_up_silero; warm_up_silero()"
 
       - name: Unit and integration tests
         run: pytest -q
 
-      - name: Voice eval (stub LLM, Whisper tiny, Kokoro, Silero; silence and Smart Turn detectors)
+      - name: Voice eval matrix (stub LLM; Whisper tiny and faster-whisper tiny, silence and Smart Turn)
         # Hosted runners are slower than the reference laptop the budgets were set on.
-        run: python -m evals.run --llm stub --turn-detector both --budget-scale 2.5
+        # Deepgram Flux and the speech-to-speech rows are skipped: CI has no keys for them.
+        run: python -m evals.run --llm stub --matrix --budget-scale 2.5
 
       - name: Keep eval results
         if: always()

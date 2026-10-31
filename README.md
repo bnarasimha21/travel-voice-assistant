@@ -12,6 +12,13 @@ recognition and Kokoro for the voice. The LLM is any OpenAI-compatible chat
 completions endpoint with tool calling (DigitalOcean serverless inference by
 default).
 
+Each stage can be swapped through settings alone: Whisper through
+transformers or faster-whisper, Deepgram Flux as hosted streaming speech
+recognition, or a speech-to-speech model (OpenAI Realtime or Gemini Live)
+in place of the whole cascade. `python -m evals.run --matrix` runs the same
+scripted conversations through each and compares them (see
+[Backends](#backends)).
+
 ## How it works
 
 ```
@@ -194,7 +201,12 @@ See `.env.example` for every setting and its default.
 | `LLM_EXTRA_QUERY` | Extra query string for every LLM call, for example `agent=true` |
 | `TOOLS`, `TOOL_TIMEOUT_S`, `FILLER_AFTER_MS` | Which tools the model gets, per-call timeout, filler delay |
 | `WEATHER_PROVIDER`, `FLIGHTS_PROVIDER`, `HOTELS_PROVIDER`, `DUFFEL_API_KEY` | Tool data sources |
-| `STT_BACKEND`, `STT_MODEL` | `transformers` with a Whisper model id |
+| `PIPELINE` | `cascade` (default) or `s2s` (see [Backends](#backends)) |
+| `STT_BACKEND`, `STT_MODEL`, `STT_DEVICE`, `STT_COMPUTE_TYPE` | `transformers` or `faster-whisper` with a Whisper model, or `deepgram-flux` |
+| `DEEPGRAM_API_KEY`, `DEEPGRAM_URL`, `DEEPGRAM_MODEL`, `DEEPGRAM_EOT_THRESHOLD`, `DEEPGRAM_EOT_TIMEOUT_MS` | Deepgram Flux |
+| `S2S_PROVIDER` | `openai` or `gemini`, for `PIPELINE=s2s` |
+| `OPENAI_API_KEY`, `OPENAI_REALTIME_URL`, `OPENAI_REALTIME_MODEL`, `OPENAI_REALTIME_VOICE`, `OPENAI_REALTIME_TRANSCRIBE_MODEL`, `OPENAI_REALTIME_TURN_DETECTION` | OpenAI Realtime |
+| `GEMINI_API_KEY`, `GEMINI_LIVE_URL`, `GEMINI_LIVE_MODEL`, `GEMINI_LIVE_VOICE` | Gemini Live |
 | `TTS_BACKEND`, `TTS_MODEL_PATH`, `TTS_VOICES_PATH`, `TTS_VOICE` | Kokoro files and voice |
 | `VAD_BACKEND`, `SILENCE_MS`, `MIN_SPEECH_MS` | Turn taking |
 | `TURN_DETECTOR` | `silence` (default) or `smart` |
@@ -301,8 +313,98 @@ Turn scores "I want to fly from Los Angeles to" (no filler) at 0.76 to 0.99
 across six voices, so it would cut that, while "I want to fly to, um" scores
 0.01 to 0.02. Real hesitation sounds different and should do better; record
 some and put them in `evals/recordings/` to check. A hosted alternative is
-Deepgram Flux, which decides end of turn from the transcript and the audio
-together.
+Deepgram Flux (`STT_BACKEND=deepgram-flux`, see [Backends](#backends)),
+which decides end of turn from the transcript and the audio together.
+
+## Backends
+
+No endpoint, model name or voice is written in the Python code: every
+default lives in `.env.example`, and the app starts with those values plus
+one API key. A test parses the package and fails if one creeps back in.
+
+### Speech to text
+
+| `STT_BACKEND` | Runs | Turn taking |
+| --- | --- | --- |
+| `transformers` (default) | Whisper on this machine through Hugging Face transformers | VAD plus `TURN_DETECTOR` |
+| `faster-whisper` | Whisper on this machine through CTranslate2 (`STT_COMPUTE_TYPE=int8` on a CPU) | VAD plus `TURN_DETECTOR` |
+| `deepgram-flux` | [Deepgram Flux](https://developers.deepgram.com/docs/flux/quickstart), hosted, streaming | Flux decides (`DEEPGRAM_EOT_THRESHOLD`) |
+
+`STT_MODEL=openai/whisper-tiny` runs the whole app on a CPU. The local
+backends are free and keep audio on the machine, but they transcribe once
+per turn, after the turn has ended, so Whisper's time adds straight to the
+reply delay (about 0.3 to 0.6 s for tiny on a laptop CPU). Flux transcribes
+while you talk and ends the turn itself from the words and the audio, so
+the transcript is ready the moment the turn ends. It costs money per minute
+of audio and sends the caller's voice to Deepgram. With Flux the browser
+audio streams to Deepgram in 80 ms chunks and `TURN_DETECTOR` is not used.
+Barge-in starts at Flux's `StartOfTurn` event, once you have talked for
+`BARGE_IN_MIN_SPEECH_MS`.
+
+### Speech to speech
+
+`PIPELINE=s2s` replaces the whole cascade with one realtime model:
+`S2S_PROVIDER=openai` ([Realtime API](https://platform.openai.com/docs/guides/realtime-websocket))
+or `gemini` ([Live API](https://ai.google.dev/gemini-api/docs/live)). The
+browser audio goes straight to the provider over a WebSocket
+(`voice_agent/realtime/`), the provider decides turns, and its audio comes
+back to the browser through the same FastRTC page. The same three travel
+tools are offered as provider function calls and run here, so
+`get_weather` works the same way. Talking over the reply stops it, and only
+what you heard is kept (OpenAI is told with `conversation.item.truncate`).
+The provider stops on its own while it is still generating; once it has
+sent the whole reply (it sends faster than real time), the handler's own
+VAD catches you talking over the rest of the playback. If the connection
+drops, the next audio frame reconnects with the conversation so far in the
+instructions. Each browser connection gets its own provider session.
+
+Why the cascade stays the default: a speech-to-speech model has lower
+latency and more natural turn taking, because there is no separate
+transcribe, think and synthesize hop. But it is billed per minute of audio,
+ties you to that provider's voices, and hides the stages: there is no
+separate transcript time or first-token time to look at, and Gemini does
+not even report when it decided you were done (its `turn_end` is recorded
+as null). The cascade lets you change any one part, run it all locally, and
+see where the time goes.
+
+LiveKit Agents and Pipecat both support these providers too (see
+[Why a custom FastRTC handler](#why-a-custom-fastrtc-handler)).
+
+### Comparison
+
+`python -m evals.run --matrix` runs every scenario once per row of
+`evals/matrix.yaml`. Rows whose key is not set are listed as skipped. The
+hosted rows feed the caller at real time, since the services decide turns
+on the wall clock.
+
+Measured on 2026-10-31 with `python -m evals.run --matrix --llm stub` on an
+Apple M5 laptop with 16 GB, CPU only, with other heavy jobs running at the
+same time. The stub LLM answers in milliseconds, so TTFA here is the speech
+pipeline alone. No Deepgram, OpenAI or Gemini key was set, so those rows did
+not run:
+
+| config | passed | pass rate | TTFA p50 ms | TTFA p95 ms | cutoffs (audible) |
+| --- | --- | --- | --- | --- | --- |
+| whisper-tiny/silence | 7/7 | 100% | 1939 | 3182 | 1 (0) |
+| whisper-tiny/smart-turn | 7/7 | 100% | 1511 | 2384 | 3 (0) |
+| faster-whisper-tiny/silence | 7/7 | 100% | 1622 | 2486 | 1 (0) |
+| deepgram-flux | skipped | - | - | - | needs DEEPGRAM_API_KEY |
+| s2s/openai | skipped | - | - | - | needs OPENAI_API_KEY |
+| s2s/gemini | skipped | - | - | - | needs GEMINI_API_KEY |
+
+In this run faster-whisper tiny (int8) took about 0.3 s off the median
+compared with the same model through transformers. Set the keys and rerun to fill in the
+hosted rows. `python -m evals.run --matrix --backends fake` runs the same
+matrix fully offline against local fakes of all three services
+(`voice_agent/testing/fake_realtime.py`); it checks the wiring, not the
+providers' speed.
+
+### Not done: phone calls
+
+Answering a phone number (FastRTC's telephone mode, or Twilio Media
+Streams) is a possible follow-up. Both handlers already resample whatever
+rate the transport delivers, so the work is in the transport and in testing
+8 kHz phone audio against each backend. It is not wired up here.
 
 ## Voice evals
 
@@ -312,6 +414,8 @@ python -m evals.run --llm live    # your configured LLM endpoint
 python -m evals.run --llm live --judge
 python -m evals.run --backends fake   # no model files at all
 python -m evals.run --llm stub --turn-detector both   # compare silence and smart
+python -m evals.run --matrix      # every backend in evals/matrix.yaml, side by side
+python -m evals.run --matrix --backends fake   # the same matrix offline, against local fakes
 ```
 
 Each file in `evals/scenarios/` is a short scripted conversation: the
@@ -339,7 +443,16 @@ An early cutoff is a reply the agent started before the scripted turn was
 over. It is counted, and it fails the scenario only when you would have
 heard it (the reply was not merged away), unless the scenario lists that
 detector under `allow_early_cutoff`. `mid_sentence_pause` tolerates it for
-`silence`, which is the point of that scenario.
+`silence`, which is the point of that scenario, and for Gemini Live, whose
+automatic activity detection is pause-based too.
+
+`--matrix` runs the scenarios once per row of `evals/matrix.yaml` and adds a
+comparison table (passed, pass rate, TTFA p50 and p95, cutoffs). The `real`
+section is used with the default `--backends real`, the `fake` section with
+`--backends fake`. A row lists the settings it changes, the keys it
+`requires` (skipped when unset), `realtime: true` to feed caller audio at
+real time, and for the fake section a `fake_server` to start. `--stt-model`
+overrides `STT_MODEL` for rows that do not set their own.
 
 Synthetic callers are cleaner and more cooperative than real people: they
 do not hesitate, mumble or talk over background noise. Put real recordings
@@ -370,7 +483,16 @@ pushing 20 ms microphone frames into `receive` and pulling reply audio out of
 Tests marked `realmodels` use real Whisper (tiny), Kokoro, Silero and the
 Smart Turn model and are skipped when the files are not on disk. They include a short stub-mode run
 of the eval suite on the real speech models. Run only them with
-`pytest -m realmodels`. `tests/test_tools_live.py` checks that the real
+`pytest -m realmodels`.
+
+`tests/test_backends.py` runs the spoken weather question through every
+local speech-to-text backend, and drives Deepgram Flux and both
+speech-to-speech providers against local fakes of their WebSocket APIs
+(`voice_agent/testing/fake_realtime.py`) that speak the providers' event
+formats and check their credentials: turn taking, tool calls, barge-in,
+reconnects, wrong keys and the offline `--matrix`. The same tests against the
+real services run only when `DEEPGRAM_API_KEY`, `OPENAI_API_KEY` or
+`GEMINI_API_KEY` is set. `tests/test_tools_live.py` checks that the real
 configured model picks `get_weather` for a weather question; it runs only
 with `RUN_LIVE_LLM=1` and LLM credentials set.
 

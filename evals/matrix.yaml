@@ -1,0 +1,63 @@
+# Configurations the eval runner compares. Values use the variable names from
+# .env.example and are layered on top of .env, .env.example and the process
+# environment: `base` applies to every run with that --backends choice, and
+# each `matrix` entry adds its own settings for `python -m evals.run --matrix`.
+#
+#   requires     config variables that must be set, or the row is skipped
+#                (hosted services need their keys)
+#   realtime     feed caller audio at real time; hosted services decide turns
+#                on the wall clock, so their timings only mean something then
+#   fake_server  start a local fake of that service (deepgram, openai or
+#                gemini) and point the config at it; used by the fake matrix
+
+real:
+  base:
+    STT_BACKEND: transformers
+    STT_MODEL: openai/whisper-tiny
+  matrix:
+    - name: whisper-tiny/silence
+      env: {TURN_DETECTOR: silence}
+    - name: whisper-tiny/smart-turn
+      env: {TURN_DETECTOR: smart}
+    - name: faster-whisper-tiny/silence
+      env: {STT_BACKEND: faster-whisper, STT_MODEL: Systran/faster-whisper-tiny, STT_COMPUTE_TYPE: int8, TURN_DETECTOR: silence}
+    - name: deepgram-flux
+      env: {STT_BACKEND: deepgram-flux}
+      requires: [DEEPGRAM_API_KEY]
+      realtime: true
+    - name: s2s/openai
+      env: {PIPELINE: s2s, S2S_PROVIDER: openai}
+      requires: [OPENAI_API_KEY]
+      realtime: true
+    - name: s2s/gemini
+      env: {PIPELINE: s2s, S2S_PROVIDER: gemini}
+      requires: [GEMINI_API_KEY]
+      realtime: true
+
+# No model files and no network: fake speech models, an energy VAD, and local
+# fakes of the hosted services. Timings only show the pipeline overhead plus
+# each detector's end-of-turn wait; the fakes answer instantly.
+fake:
+  base:
+    STT_BACKEND: fake
+    TTS_BACKEND: fake
+    VAD_BACKEND: energy
+    ENERGY_VAD_THRESHOLD_DB: "-20"  # fake speech is a loud tone; keep 15 dB SNR noise below the gate
+    SMART_TURN_BACKEND: fake
+  matrix:
+    - name: fake/silence
+      env: {TURN_DETECTOR: silence}
+    - name: fake/smart-turn
+      env: {TURN_DETECTOR: smart}
+    - name: fake-deepgram-flux
+      env: {STT_BACKEND: deepgram-flux, DEEPGRAM_MODEL: fake-flux}
+      fake_server: deepgram
+      realtime: true
+    - name: fake-s2s/openai
+      env: {PIPELINE: s2s, S2S_PROVIDER: openai, OPENAI_REALTIME_MODEL: fake-realtime, OPENAI_REALTIME_VOICE: fake, OPENAI_REALTIME_TURN_DETECTION: semantic_vad}
+      fake_server: openai
+      realtime: true
+    - name: fake-s2s/gemini
+      env: {PIPELINE: s2s, S2S_PROVIDER: gemini, GEMINI_LIVE_MODEL: fake-live, GEMINI_LIVE_VOICE: fake}
+      fake_server: gemini
+      realtime: true
