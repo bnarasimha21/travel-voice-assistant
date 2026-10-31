@@ -75,6 +75,10 @@ class OpenAIRealtimeAdapter:
         self._connect = connect
         self._ws = None
         self._items: dict[str, str] = {}  # response id -> assistant audio item id
+        # Cancelled responses the caller never heard whose items were not known
+        # at cancel time: any item they produce is deleted when it shows up.
+        self._forget_responses: set[str] = set()
+        self._forgotten_items: set[str] = set()
 
     def session_config(self, instructions: str, tools: Any) -> dict[str, Any]:
         audio_in: dict[str, Any] = {
@@ -147,6 +151,34 @@ class OpenAIRealtimeAdapter:
             later_item = self._items.get(later)
             if later_item and later_item != item_id:
                 await self._ws.send(dumps({"type": "conversation.item.delete", "item_id": later_item}))
+        # Responses not heard at all whose items have not arrived yet (one just
+        # created, or cancelled as an orphan): delete their items once they do.
+        unseen = [r for r in (*unheard, active) if r and r != response_id and r not in self._items]
+        if played_ms <= 0 and response_id not in self._items:
+            unseen.append(response_id)
+        self._forget_responses.update(unseen)
+
+    def _items_to_forget(self, m: dict[str, Any]) -> list[str]:
+        """Item ids of a forgotten response carried by this server event."""
+        kind = str(m.get("type", ""))
+        if not kind.startswith("response."):
+            return []
+        if kind == "response.done":
+            response = m.get("response") or {}
+            rid = str(response.get("id", ""))
+            ids = [str(o.get("id")) for o in response.get("output") or [] if o.get("id")]
+            if rid in self._forget_responses:
+                self._forget_responses.discard(rid)  # nothing more comes for it
+            else:
+                return []
+        else:
+            if str(m.get("response_id", "")) not in self._forget_responses:
+                return []
+            item = m.get("item") or {}
+            ids = [str(i) for i in (m.get("item_id"), item.get("id")) if i]
+        fresh = [i for i in dict.fromkeys(ids) if i not in self._forgotten_items]
+        self._forgotten_items.update(fresh)
+        return fresh
 
     async def events(self) -> AsyncIterator[RealtimeEvent]:
         ws = self._ws
@@ -158,6 +190,8 @@ class OpenAIRealtimeAdapter:
                     message = json.loads(raw)
                 except (TypeError, ValueError):
                     continue
+                for item_id in self._items_to_forget(message):
+                    await ws.send(dumps({"type": "conversation.item.delete", "item_id": item_id}))
                 for event in self._translate(message):
                     yield event
         except asyncio.CancelledError:

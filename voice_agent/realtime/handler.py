@@ -427,8 +427,6 @@ class S2SHandler(AsyncStreamHandler):
         elif isinstance(event, UserTranscript):
             self._on_transcript(event)
         elif isinstance(event, UserItemCommitted):
-            # A response created from here on may be the server's answer to these words.
-            self._orphan_responses = 0
             current = self._current
             if event.item_id in self._late_items or (current is not None and event.item_id in current.items):
                 return
@@ -437,6 +435,10 @@ class S2SHandler(AsyncStreamHandler):
                 # (its speech_started came before this reply's first audio): the
                 # reply is stale, so end it as a barge-in before taking the new words.
                 self.barge_in()
+            # A response created from here on may be the server's answer to these
+            # words, so no untagged response counts as an orphan any more (set
+            # after barge_in, which counts the stale reply's pending tool answer).
+            self._orphan_responses = 0
             self._pending_items.setdefault(event.item_id, "")
         elif isinstance(event, UserSpeechStarted):
             self._speech_stopped_at = None
@@ -517,12 +519,13 @@ class S2SHandler(AsyncStreamHandler):
         if not rid or rid in self._cancelled:
             return
         reply = self._current
-        if reply is not None:
+        if reply is not None and (reply.requested_response or not event.requested):
             reply.response_ids.add(rid)
             reply.last_response_id = rid
             reply.requested_response = False
             return
-        if event.requested or self._orphan_responses > 0:
+        # A tool answer this reply did not ask for belongs to an interrupted one.
+        if event.requested or (reply is None and self._orphan_responses > 0):
             self._orphan_responses = max(0, self._orphan_responses - 1)
             self._cancelled.add(rid)
             adapter = self.adapter

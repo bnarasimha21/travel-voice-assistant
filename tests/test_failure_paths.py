@@ -597,6 +597,82 @@ async def test_s2s_a_response_created_during_the_reply_is_cancelled_by_name():
     assert "R2" in handler._cancelled and handler._orphan_responses == 0
 
 
+async def test_s2s_a_stale_reply_ended_by_a_new_item_does_not_silence_the_next_answer():
+    """The stale reply was waiting for its tool answer when the caller's new
+    item B committed. The server's (untagged) answer to B must still play."""
+    handler, adapter, _ = _s2s(tools=_weather_tools())
+    handler.bind_session()
+    handler.on_event(UserItemCommitted("A"))
+    handler.on_event(ResponseStarted("R1"))
+    handler.on_event(UserSpeechStarted())  # no reply open yet
+    handler.on_event(ResponseDone("R1", [RealtimeToolCall("c1", "get_weather", '{"location": "Paris"}')]))
+    for _ in range(50):
+        if adapter.sent:
+            break
+        await asyncio.sleep(0.01)
+    assert handler._current is not None and handler._current.requested_response
+    handler.on_event(UserItemCommitted("B"))
+    assert handler._current is None and handler._orphan_responses == 0
+    handler.on_event(ResponseStarted("R3"))
+    await asyncio.sleep(0)
+    assert "R3" not in handler._cancelled and all(i[0] != "R3" for i in adapter.interrupts)
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "R3"))
+    assert handler._current is not None and "R3" in handler._current.response_ids
+
+
+async def test_s2s_a_tagged_answer_the_open_reply_did_not_ask_for_is_cancelled():
+    handler, adapter, _ = _s2s()
+    handler.bind_session()
+    handler.on_event(UserItemCommitted("B"))
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "R3"))  # the answer to B is playing
+    handler.on_event(ResponseStarted("R2", requested=True))  # a tool answer for an earlier reply
+    await asyncio.sleep(0)
+    assert handler._current.last_response_id == "R3" and "R2" not in handler._current.response_ids
+    assert "R2" in handler._cancelled and ("R2", 0, [], "R2") in adapter.interrupts
+
+
+class _ScriptedSocket(_RecordingSocket):
+    def __init__(self, incoming):
+        super().__init__()
+        self._incoming = [json.dumps(m) for m in incoming]
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._incoming:
+            raise StopAsyncIteration
+        await asyncio.sleep(0)
+        return self._incoming.pop(0)
+
+
+async def test_openai_deletes_the_items_of_a_cancelled_unheard_response_when_they_arrive():
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    adapter._ws = _ScriptedSocket(
+        [
+            {"type": "response.output_item.added", "response_id": "R2", "item": {"id": "it1", "type": "message"}},
+            {"type": "response.output_audio.delta", "response_id": "R2", "item_id": "it1", "delta": ""},
+            {"type": "response.output_audio.delta", "response_id": "R5", "item_id": "it5", "delta": ""},
+            {"type": "response.done", "response": {"id": "R2", "status": "cancelled", "output": [{"id": "it1"}, {"id": "fc1"}]}},
+            {"type": "response.done", "response": {"id": "R5", "status": "completed", "output": [{"id": "it5"}]}},
+        ]
+    )
+    await adapter.interrupt("R2", 0, [], "R2")  # an orphan: nothing of it known yet
+    assert adapter._ws.sent == [{"type": "response.cancel", "response_id": "R2"}]
+    [e async for e in adapter.events()]
+    deletes = [m["item_id"] for m in adapter._ws.sent if m["type"] == "conversation.item.delete"]
+    assert deletes == ["it1", "fc1"]  # each once, and never R5's
+    assert "R2" not in adapter._forget_responses
+
+
+async def test_openai_heard_response_is_truncated_not_forgotten():
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    adapter._ws = _RecordingSocket()
+    adapter._items = {"R1": "item_a"}
+    await adapter.interrupt("R1", 250, [], "R1")
+    assert not adapter._forget_responses
+
+
 def test_openai_translates_response_created_and_tags_tool_answers():
     from voice_agent.realtime.openai_realtime import TOOL_RESPONSE_METADATA
 
