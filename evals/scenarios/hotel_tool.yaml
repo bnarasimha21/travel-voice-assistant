@@ -1,0 +1,8 @@
+name: hotel_tool
+description: A hotel search; the answer must name one of the sample San Diego hotels.
+caller: {voice: am_adam, speed: 1.0}
+ttfa_budget_ms: 3500
+turns:
+  - say: I need a hotel in San Diego for two nights starting Friday.
+    expect_tools: [search_hotels]
+    facts: [[hotel del coronado, pacific terrace, sofia]]

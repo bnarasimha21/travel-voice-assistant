@@ -67,6 +67,7 @@ def build_ui(backends: Backends, settings: Settings) -> gr.Blocks:
                     rtc_configuration=rtc_configuration(settings),
                 )
                 clear = gr.Button("Clear conversation")
+                latency = gr.Markdown("Latency appears here after your first turn.", label="Last turn latency")
             with gr.Column(scale=2):
                 chatbot = gr.Chatbot(type="messages", label="Conversation", height=480)
         webrtc.stream(
@@ -76,7 +77,9 @@ def build_ui(backends: Backends, settings: Settings) -> gr.Blocks:
             concurrency_limit=MAX_SESSIONS,
             time_limit=None,
         )
-        webrtc.on_additional_outputs(lambda chat: chat, outputs=[chatbot], concurrency_limit=MAX_SESSIONS)
+        webrtc.on_additional_outputs(
+            lambda chat, breakdown: (chat, breakdown), outputs=[chatbot, latency], concurrency_limit=MAX_SESSIONS
+        )
         clear.click(lambda value: clear_session(backends, value), inputs=[webrtc], outputs=[chatbot])
     return demo
 

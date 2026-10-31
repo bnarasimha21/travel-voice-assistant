@@ -188,7 +188,86 @@ See `.env.example` for every setting and its default.
 | `TTS_BACKEND`, `TTS_MODEL_PATH`, `TTS_VOICES_PATH`, `TTS_VOICE` | Kokoro files and voice |
 | `VAD_BACKEND`, `SILENCE_MS`, `MIN_SPEECH_MS` | Turn taking |
 | `BARGE_IN`, `BARGE_IN_MIN_SPEECH_MS` | Talking over the agent |
+| `METRICS_LOG` | Per-turn latency log (`logs/turns.jsonl`), or `none` |
 | `SERVER_NAME`, `SERVER_PORT`, `SHARE`, `TURN_SERVER` | Web server |
+
+## Latency budget
+
+Every turn is timed (`voice_agent/metrics.py`) and written as one JSON line
+to `logs/turns.jsonl`. Each stage is in milliseconds after you stopped
+talking, and every key is present in every line (null when the stage did
+not happen):
+
+| Stage | Meaning |
+| --- | --- |
+| `turn_end` | the turn detector decided you were done (the `SILENCE_MS` pause) |
+| `stt_done` | transcript ready |
+| `llm_first_token` | first text from the model |
+| `tool_start`, `tool_end` | first tool call requested, first tool round returned |
+| `tts_first_chunk` | first chunk of the reply synthesized |
+| `first_audio_sent` | first reply frame handed to WebRTC: time to first audio (TTFA) |
+| `llm_done`, `reply_end` | model finished; reply finished or was interrupted |
+
+The record also has the outcome (`completed`, `interrupted`, `failed`, ...),
+the tools called and `ttfa_ms`. The page shows the last turn's breakdown and
+the session's TTFA p50 and p95 under the microphone.
+
+Measured with `python -m evals.run --llm stub --repeats 3` (27 turns) on an
+Apple M5 laptop with 16 GB, everything on the CPU: Whisper tiny through
+transformers, Kokoro int8 through ONNX Runtime, Silero VAD. The stub LLM
+answers in a few milliseconds, so these numbers are the speech pipeline
+alone; add your endpoint's time to first token. Other heavy jobs were
+running on the machine at the time, which is why p95 is well above p50.
+
+| Stage | Median ms after end of speech |
+| --- | ---: |
+| Turn detected (700 ms pause) | 704 |
+| Transcript ready | 1295 |
+| LLM first token (stub) | 1303 |
+| First audio synthesized | 1996 |
+| First audio sent (TTFA) | 1997 |
+
+TTFA p50 is 2.0 s and p95 2.9 s. The pause before the turn ends (0.7 s),
+Whisper (about 0.6 s) and synthesizing the first chunk (about 0.7 s) each
+take roughly a third. Lowering `SILENCE_MS` is the cheapest win but cuts
+people off more often. A GPU droplet has not been measured yet; run the
+same command there and compare.
+
+## Voice evals
+
+```bash
+python -m evals.run --llm stub    # offline: stub LLM, Whisper tiny, Kokoro, Silero
+python -m evals.run --llm live    # your configured LLM endpoint
+python -m evals.run --llm live --judge
+python -m evals.run --backends fake   # no model files at all
+```
+
+Each file in `evals/scenarios/` is a short scripted conversation: the
+caller's lines, the tools each answer must call, facts the answer must
+contain, an optional interruption point, and a TTFA budget. Caller audio is
+synthesized with Kokoro in a different voice and speed per scenario, with
+white noise mixed in for `noisy_audio`, and pushed into a real
+`VoiceHandler` 20 ms at a time at 48 kHz, as a browser would send it. Tool
+data comes from the offline sample providers so answers can be checked.
+
+Per turn the runner checks the transcript's word error rate, the tools
+called, the required facts, and that an interrupted reply stopped and was
+stored as interrupted. Per scenario it checks that p95 TTFA is within the
+budget (`--budget-scale` multiplies all budgets; CI uses 2.5 because hosted
+runners are slower). It prints a table, saves JSON to `evals/results/`, and
+exits non-zero if anything failed. By default caller audio is pushed faster
+than real time; pass `--realtime` to feed it at real time instead. TTFA
+counts the end-of-turn pause either way.
+
+Synthetic callers are cleaner and more cooperative than real people: they
+do not hesitate, mumble or talk over background noise. Put real recordings
+in `evals/recordings/` (gitignored) and point a turn at one with
+`audio: recordings/clip.wav`, keeping `say` as the reference transcript.
+Scenarios whose recordings are missing are skipped.
+
+`evals/judge.py` is optional and only runs with `--llm live --judge`: it
+asks the model to grade each completed answer for helpfulness and spoken
+length. The deterministic checks never depend on it.
 
 ## Tests
 
@@ -207,7 +286,8 @@ pushing 20 ms microphone frames into `receive` and pulling reply audio out of
 `emit` (`voice_agent/testing/harness.py`).
 
 Tests marked `realmodels` use real Whisper (tiny), Kokoro and Silero and are
-skipped when the files are not on disk. Run only them with
+skipped when the files are not on disk. They include a short stub-mode run
+of the eval suite on the real speech models. Run only them with
 `pytest -m realmodels`. `tests/test_tools_live.py` checks that the real
 configured model picks `get_weather` for a weather question; it runs only
 with `RUN_LIVE_LLM=1` and LLM credentials set.

@@ -91,11 +91,22 @@ class Settings:
     barge_in: bool = True
     barge_in_min_speech_ms: int = 300
 
+    # Per-turn latency log (JSON lines). Relative paths are under the repo; none disables it.
+    metrics_log: str = "logs/turns.jsonl"
+
     # Web server.
     server_name: str = "127.0.0.1"
     server_port: int = 7860
     share: bool = False
     turn_server: str = ""
+
+    @property
+    def metrics_log_path(self) -> Path | None:
+        value = self.metrics_log.strip()
+        if value.lower() in ("", "none", "off"):
+            return None
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else REPO_ROOT / path
 
     @property
     def llm_query(self) -> dict[str, str]:

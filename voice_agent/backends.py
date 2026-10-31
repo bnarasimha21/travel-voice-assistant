@@ -6,6 +6,7 @@ from .config import ConfigError, Settings
 from .fakes import FakeSTT, FakeTTS
 from .handler import Backends
 from .llm import OpenAICompatibleLLM
+from .metrics import TurnLog
 from .session import SessionStore
 from .turn import SilenceTurnDetector, TurnDetector
 from .vad import EnergyVAD, SileroVAD, warm_up_silero
@@ -90,4 +91,5 @@ def build_backends(
         tools=tools if tools is not None else build_registry(settings),
         max_tool_rounds=settings.max_tool_rounds,
         filler_after_ms=settings.filler_after_ms,
+        turn_log=TurnLog(settings.metrics_log_path) if settings.metrics_log_path else None,
     )

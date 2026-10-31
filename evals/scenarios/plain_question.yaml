@@ -1,0 +1,9 @@
+name: plain_question
+description: Small talk with no tool use; the agent must answer without calling a tool.
+caller: {voice: af_heart, speed: 1.0}
+ttfa_budget_ms: 3500
+turns:
+  - say: Hi, what kinds of trips can you help me plan?
+    expect_tools: []
+  - say: Great, thank you. I will think about it and call back.
+    expect_tools: []

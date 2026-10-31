@@ -1,0 +1,11 @@
+name: flight_tool
+description: A flight search, then a follow-up weather question about the destination.
+caller: {voice: bf_emma, speed: 0.9}
+ttfa_budget_ms: 3500
+turns:
+  - say: Can you find me a flight from Los Angeles to San Francisco tomorrow?
+    expect_tools: [search_flights]
+    facts: [southwest, "98"]
+  - say: And what is the weather in San Francisco tomorrow?
+    expect_tools: [get_weather]
+    facts: [san francisco]

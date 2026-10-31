@@ -30,6 +30,7 @@ from fastrtc.utils import current_context
 from .audio import STT_SAMPLE_RATE, resample, to_mono_float32
 from .chunker import SentenceChunker
 from .llm import LLMError, TextDelta, ToolFinished, ToolStarted, stream_with_tools
+from .metrics import TurnLog, TurnTimer, format_breakdown, ttfa_summary
 from .prompts import LLM_FALLBACK_LINE, system_prompt
 from .session import Session, SessionStore
 from .turn import TurnDetector, TurnEnded, TurnTaker
@@ -60,6 +61,7 @@ class Backends:
     max_tool_rounds: int = 4
     filler_after_ms: float = 300
     filler_cache: dict[str, np.ndarray] = field(default_factory=dict)
+    turn_log: TurnLog | None = None  # one JSON line per turn, or None to skip writing
 
     async def filler_audio(self, text: str) -> np.ndarray:
         """Filler lines are synthesized once and reused, so they start instantly."""
@@ -97,6 +99,7 @@ class Reply:
     emitted: int = 0  # samples handed to the transport
     failed: bool = False
     task: asyncio.Task | None = None
+    timer: TurnTimer | None = None
     first_audio_at: float | None = None
     llm_done_at: float | None = None
 
@@ -167,6 +170,7 @@ class VoiceHandler(AsyncStreamHandler):
         self._play_end = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self.barge_ins: list[float] = []  # perf_counter timestamps, for tests and logs
+        self.turn_records: list[dict[str, Any]] = []  # this connection's latency records
 
     # FastRTC interface -------------------------------------------------------
 
@@ -221,7 +225,16 @@ class VoiceHandler(AsyncStreamHandler):
         if item.reply is not self._current:
             return None  # interrupted while waiting: never send it
         self._play_end += item.samples.size / self.output_sample_rate
-        item.reply.emitted += item.samples.size
+        reply = item.reply
+        if reply.first_audio_at is None:
+            reply.first_audio_at = time.perf_counter()
+            reply.timer.mark("first_audio_sent", reply.first_audio_at)
+            log.info(
+                "first audio %.0f ms after end of speech; LLM still generating: %s",
+                reply.timer.offset_ms("first_audio_sent"),
+                reply.llm_done_at is None,
+            )
+        reply.emitted += item.samples.size
         return (self.output_sample_rate, item.samples.reshape(1, -1))
 
     # Session -----------------------------------------------------------------
@@ -235,6 +248,26 @@ class VoiceHandler(AsyncStreamHandler):
             self.session = self.backends.store.get(sid)
             self.session.on_reset(self._on_session_reset)
         return self.session
+
+    def _outputs(self, chat: list) -> AdditionalOutputs:
+        """UI update: the chat panel plus the latest latency breakdown."""
+        return AdditionalOutputs(chat, self.latency_markdown())
+
+    def latency_markdown(self) -> str:
+        shown = [r for r in self.turn_records if r["outcome"] != "empty"]
+        return format_breakdown(shown[-1] if shown else None, ttfa_summary(shown))
+
+    def _record_turn(self, reply: Reply, outcome: str) -> None:
+        timer = reply.timer
+        if timer is None or timer.done:
+            return
+        record = timer.finish(outcome)
+        self.turn_records.append(record)
+        if self.backends.turn_log is not None:
+            try:
+                self.backends.turn_log.write(record)
+            except OSError as exc:
+                log.warning("could not write turn log: %s", exc)
 
     def _on_session_reset(self) -> None:
         """Called by Session.reset, possibly from a Gradio worker thread."""
@@ -265,7 +298,14 @@ class VoiceHandler(AsyncStreamHandler):
             # the visitor had not finished, so answer both parts together.
             turn = _merge_turns(self._carry, turn)
             self._carry = None
+        session = self.bind_session()
         reply = Reply(turn=turn)
+        reply.timer = TurnTimer(
+            session_id=session.id,
+            turn_index=len(self.turn_records),
+            end_of_turn_delay_ms=turn.end_of_turn_delay_ms,
+            turn_detector=getattr(self.turns.detector, "name", ""),
+        )
         self._current = reply
         reply.task = asyncio.create_task(self._reply(reply))
 
@@ -275,11 +315,12 @@ class VoiceHandler(AsyncStreamHandler):
         transcript = turn.transcript
         if transcript is None:
             transcript = (await self.backends.stt.transcribe(turn.audio)).strip()
+        reply.timer.mark("stt_done")
         if not transcript:
             self._out.put_nowait(_End(reply))
             return
         reply.user = transcript
-        self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(pending_user=transcript))))
+        self._out.put_nowait(_UI(self._outputs(session.chat_messages(pending_user=transcript))))
         messages = session.llm_messages(system_prompt(tools=bool(self.backends.tools)), transcript)
 
         chunks: asyncio.Queue[str | _Prerendered | None] = asyncio.Queue()
@@ -296,6 +337,8 @@ class VoiceHandler(AsyncStreamHandler):
                     async for event in events:
                         if isinstance(event, TextDelta):
                             reply.text += event.text
+                            if event.text.strip():
+                                reply.timer.mark("llm_first_token")
                             spoke_this_round = spoke_this_round or bool(event.text.strip())
                             for chunk in chunker.push(event.text):
                                 chunks.put_nowait(chunk)
@@ -306,6 +349,8 @@ class VoiceHandler(AsyncStreamHandler):
                                 chunks.put_nowait(chunk)
                             reply.text = ""
                             reply.pending_tools.append(event.call)
+                            reply.timer.mark("tool_start")
+                            reply.timer.tools.append(event.call.name)
                             if filler_task is None and not reply.filler_used and not spoke_this_round:
                                 filler_task = asyncio.create_task(self._filler_after(reply, chunks, event.call.name))
                             self._show(session, reply)
@@ -321,12 +366,14 @@ class VoiceHandler(AsyncStreamHandler):
                                 reply.text += apology + " "
                                 log.warning("tool %s failed: %s", event.call.name, event.result.data.get("error"))
                             if event.messages:
+                                reply.timer.mark("tool_end")
                                 reply.tool_messages.extend(event.messages)
                                 spoke_this_round = False
                                 self._show(session, reply)
                 for chunk in chunker.flush():
                     chunks.put_nowait(chunk)
                 reply.llm_done_at = time.perf_counter()
+                reply.timer.mark("llm_done", reply.llm_done_at)
             except LLMError as exc:
                 log.warning("LLM call failed for session %s: %s", session.id, exc)
                 reply.failed = True
@@ -342,7 +389,7 @@ class VoiceHandler(AsyncStreamHandler):
     def _show(self, session: Session, reply: Reply) -> None:
         """Update the chat panel with the turn in progress, tool calls included."""
         chat = session.chat_messages(pending_user=reply.user, pending_tools=reply.tool_messages)
-        self._out.put_nowait(_UI(AdditionalOutputs(chat)))
+        self._out.put_nowait(_UI(self._outputs(chat)))
 
     async def _filler_after(self, reply: Reply, chunks: asyncio.Queue, tool_name: str) -> None:
         """If the tool is still running after `filler_after_ms`, say a short line."""
@@ -366,15 +413,10 @@ class VoiceHandler(AsyncStreamHandler):
                 text, filler = item, False
                 audio = np.asarray(await self.backends.tts.synthesize(text), dtype=np.float32)
             reply.segments.append(Segment(text, audio.size, filler))
+            if audio.size:
+                reply.timer.mark("tts_first_chunk")
             for start in range(0, audio.size, frame):
                 self._out.put_nowait(_Audio(audio[start : start + frame], reply))
-            if reply.first_audio_at is None:
-                reply.first_audio_at = time.perf_counter()
-                log.info(
-                    "first audio %.0f ms after end of speech; LLM still generating: %s",
-                    (reply.first_audio_at - reply.turn.speech_end_at) * 1000,
-                    reply.llm_done_at is None,
-                )
 
     def _finish_reply(self, reply: Reply) -> AdditionalOutputs | None:
         """The last frame of the reply has been handed out: commit it."""
@@ -383,10 +425,12 @@ class VoiceHandler(AsyncStreamHandler):
         self._current = None
         session = self.bind_session()
         if not reply.user:
+            self._record_turn(reply, "empty")
             return None
+        self._record_turn(reply, "failed" if reply.failed else "completed")
         if not reply.failed:
             session.commit_turn(reply.user, reply.text.strip(), tool_messages=reply.tool_messages)
-        return AdditionalOutputs(session.chat_messages())
+        return self._outputs(session.chat_messages())
 
     def barge_in(self) -> None:
         """The visitor talked over the reply: stop it and keep only what was heard."""
@@ -395,6 +439,7 @@ class VoiceHandler(AsyncStreamHandler):
             return
         self.barge_ins.append(time.perf_counter())
         heard = max(0, reply.emitted - int(round(self.unplayed_seconds() * self.output_sample_rate)))
+        self._record_turn(reply, "merged" if heard == 0 else "interrupted")
         self._stop_reply()
         session = self.bind_session()
         if heard == 0:
@@ -405,13 +450,15 @@ class VoiceHandler(AsyncStreamHandler):
         if reply.user and not reply.failed:
             spoken = reply.spoken_text(heard)
             session.commit_turn(reply.user, spoken, interrupted=True, tool_messages=reply.tool_messages)
-            self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages())))
+            self._out.put_nowait(_UI(self._outputs(session.chat_messages())))
         log.info("session %s: barge-in after %.2f s of reply audio", session.id, heard / self.output_sample_rate)
 
     def _stop_reply(self) -> None:
         reply, self._current = self._current, None
-        if reply is not None and reply.task is not None and not reply.task.done():
-            reply.task.cancel()
+        if reply is not None:
+            self._record_turn(reply, "cancelled")  # no-op if barge_in already recorded it
+            if reply.task is not None and not reply.task.done():
+                reply.task.cancel()
         self._drain()
         self._play_end = time.perf_counter()
 

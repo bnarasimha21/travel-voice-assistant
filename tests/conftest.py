@@ -20,6 +20,7 @@ FAKE_ENV = {
     "WEATHER_PROVIDER": "fixture",
     "FLIGHTS_PROVIDER": "fixture",
     "HOTELS_PROVIDER": "fixture",
+    "METRICS_LOG": "none",
 }
 
 
