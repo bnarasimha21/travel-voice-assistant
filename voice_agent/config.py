@@ -89,6 +89,13 @@ class Settings:
     min_speech_ms: int = 250
     max_turn_s: float = 30.0
     barge_in: bool = True
+    # Turn detector: silence (pause threshold) or smart (Smart Turn model at a short pause).
+    turn_detector: str = "silence"
+    smart_turn_backend: str = "onnx"
+    smart_turn_model_path: str = ""
+    smart_turn_pause_ms: int = 200
+    smart_turn_max_silence_ms: int = 2000
+    smart_turn_threshold: float = 0.5
     barge_in_min_speech_ms: int = 300
 
     # Per-turn latency log (JSON lines). Relative paths are under the repo; none disables it.

@@ -171,7 +171,10 @@ class StubLLMServer:
                 Route("/chat/completions", self._handle, methods=["POST"]),
             ]
         )
-        config = uvicorn.Config(app, log_level="warning", lifespan="off")
+        # A long keep-alive: the client reuses pooled connections with no retry, and
+        # uvicorn's 5 s default closes an idle one just as an eval scenario that
+        # paused longer than that sends on it ("Connection error").
+        config = uvicorn.Config(app, log_level="warning", lifespan="off", timeout_keep_alive=600)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [sock]}, daemon=True)
         self._thread.start()

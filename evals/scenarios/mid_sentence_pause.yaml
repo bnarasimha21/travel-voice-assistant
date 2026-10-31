@@ -1,0 +1,13 @@
+name: mid_sentence_pause
+description: >
+  The caller stops for a second after "I want to fly to, um" and then
+  finishes. A pause-only detector ends the turn in that pause (an early
+  cutoff, tolerated for `silence`); usually nothing has played yet, so the
+  handler merges both parts and pays for it in latency. Smart Turn must wait.
+caller: {voice: af_heart, speed: 1.0}
+ttfa_budget_ms: 3500
+allow_early_cutoff: [silence]
+turns:
+  - say: I want to fly to, um [pause 1.0] San Diego tomorrow.
+    expect_tools: [search_flights]
+    facts: [san]

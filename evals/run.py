@@ -19,6 +19,13 @@ browser microphone. The run checks, per turn:
   interrupted)
 - latency: the scenario's p95 time to first audio must be within
   `ttfa_budget_ms` (times `--budget-scale`)
+- turn taking: ending a turn before the caller finished a line is an early
+  cutoff (a line may contain `[pause 1.0]` to provoke one). If the caller
+  resumes before any of the reply is heard, the handler merges both parts and
+  the cutoff is "recovered": counted, never a failure. An audible cutoff (a
+  reply to half a line was played) fails the scenario unless the detector is
+  listed in `allow_early_cutoff`. Rates are reported per detector
+  (`--turn-detector silence|smart|both`)
 
 It prints a table and exits with status 1 if any scenario fails.
 
@@ -62,6 +69,8 @@ EVALS_DIR = Path(__file__).resolve().parent
 SCENARIOS_DIR = EVALS_DIR / "scenarios"
 RESULTS_DIR = EVALS_DIR / "results"
 DEFAULT_STT_MODEL = "openai/whisper-tiny"
+PAUSE_MARK = re.compile(r"\[pause\s+([0-9.]+)\]")
+TRAILING_SILENCE_S = 2.5  # longer than the smart detector's max-silence fallback
 INPUT_RATE = 48000  # browsers send 48 kHz; the handler resamples like in production
 FAKE_ENERGY_THRESHOLD_DB = -20.0  # fake speech is a loud tone; keep 15 dB SNR noise below the gate
 
@@ -77,6 +86,24 @@ class ScriptedTurn:
     facts: list[list[str]] = field(default_factory=list)
     interrupt_after_s: float | None = None
 
+    @property
+    def text(self) -> str:
+        """The line without pause marks: the reference transcript."""
+        return " ".join(PAUSE_MARK.sub(" ", self.say).split())
+
+    def parts(self) -> list[tuple[str, float]]:
+        """(text, pause after it in seconds) pieces of the line."""
+        pieces = PAUSE_MARK.split(self.say)
+        out = []
+        for i in range(0, len(pieces), 2):
+            pause = float(pieces[i + 1]) if i + 1 < len(pieces) else 0.0
+            out.append((pieces[i].strip(), pause))
+        return [(t, p) for t, p in out if t or p]
+
+    @property
+    def pauses(self) -> int:
+        return len(PAUSE_MARK.findall(self.say))
+
 
 @dataclass
 class Scenario:
@@ -89,6 +116,7 @@ class Scenario:
     noise_snr_db: float | None = None
     ttfa_budget_ms: float = 2000.0
     max_wer: float = 0.25
+    allow_early_cutoff: list[str] = field(default_factory=list)
 
 
 def _facts(raw: Any) -> list[list[str]]:
@@ -118,6 +146,9 @@ def load_scenario(path: Path) -> Scenario:
                 interrupt_after_s=t.get("interrupt_after_s"),
             )
         )
+    for i, t in enumerate(turns):
+        if t.audio and t.pauses:
+            raise ValueError(f"{path.name}: turn {i + 1} has both `audio` and pause marks")
     if turns[-1].interrupt_after_s is not None:
         raise ValueError(f"{path.name}: the last turn cannot be interrupted (nothing follows it)")
     caller = data.get("caller") or {}
@@ -131,6 +162,7 @@ def load_scenario(path: Path) -> Scenario:
         noise_snr_db=caller.get("noise_snr_db"),
         ttfa_budget_ms=float(data.get("ttfa_budget_ms", 2000)),
         max_wer=float(data.get("max_wer", 0.25)),
+        allow_early_cutoff=[str(d) for d in data.get("allow_early_cutoff") or []],
     )
 
 
@@ -189,6 +221,7 @@ class Options:
     realtime: bool = False
     budget_scale: float = 1.0
     stub_delay_ms: float = 0.0
+    turn_detector: str | None = None  # silence | smart | both; None uses TURN_DETECTOR
     judge: bool = False
     scenarios: list[str] | None = None
     scenarios_dir: Path = SCENARIOS_DIR
@@ -221,6 +254,14 @@ class ScenarioResult:
     ttfa_p50_ms: float | None = None
     ttfa_p95_ms: float | None = None
     budget_ms: float = 0.0
+    detector: str = ""
+    scripted_turns: int = 0
+    early_cutoffs: int = 0
+    audible_cutoffs: int = 0
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} [{self.detector}]" if self.detector else self.name
 
     @property
     def max_wer(self) -> float | None:
@@ -246,11 +287,28 @@ class EvalReport:
         for stage in STAGES:
             values = [t.stages_ms.get(stage) for t in turns if t.stages_ms.get(stage) is not None]
             stages[stage] = round(statistics.median(values), 1) if values else None
+        detectors: dict[str, dict[str, Any]] = {}
+        for det in dict.fromkeys(s.detector for s in self.scenarios):
+            runs = [s for s in self.scenarios if s.detector == det and s.status != "skip"]
+            scripted = sum(s.scripted_turns for s in runs)
+            cutoffs = sum(s.early_cutoffs for s in runs)
+            audible = sum(s.audible_cutoffs for s in runs)
+            det_ttfa = [t.ttfa_ms for s in runs for t in s.turns if t.ttfa_ms is not None]
+            detectors[det] = {
+                "scripted_turns": scripted,
+                "early_cutoffs": cutoffs,
+                "early_cutoff_rate": round(cutoffs / scripted, 3) if scripted else None,
+                "audible_cutoffs": audible,
+                "audible_cutoff_rate": round(audible / scripted, 3) if scripted else None,
+                "ttfa_p50_ms": percentile(det_ttfa, 50),
+                "ttfa_p95_ms": percentile(det_ttfa, 95),
+            }
         return {
             "turns": len(ttfa),
             "ttfa_p50_ms": percentile(ttfa, 50),
             "ttfa_p95_ms": percentile(ttfa, 95),
             "median_stages_ms": stages,
+            "detectors": detectors,
         }
 
     def to_json(self) -> dict[str, Any]:
@@ -264,6 +322,9 @@ class EvalReport:
             "scenarios": [
                 {
                     "name": s.name,
+                    "detector": s.detector,
+                    "early_cutoffs": s.early_cutoffs,
+                    "audible_cutoffs": s.audible_cutoffs,
                     "status": s.status,
                     "failures": s.failures,
                     "ttfa_p50_ms": s.ttfa_p50_ms,
@@ -287,16 +348,24 @@ class Caller:
         if turn.audio:
             rate, audio = read_wav(EVALS_DIR / turn.audio)
             audio = resample(audio, rate, INPUT_RATE)
-        elif self.fake:
-            # The fake recogniser decodes fixed-length tones, so voice and speed do not apply.
-            audio = await FakeTTS(sample_rate=INPUT_RATE).synthesize(turn.say)
         else:
-            audio = await self.tts.synthesize(turn.say, voice=scenario.voice, speed=scenario.speed)
-            audio = resample(audio, self.tts.sample_rate, INPUT_RATE)
+            pieces = []
+            for text, pause in turn.parts():
+                if text:
+                    pieces.append(await self._speak(scenario, text))
+                pieces.append(np.zeros(int(pause * INPUT_RATE), dtype=np.float32))
+            audio = np.concatenate(pieces)
         return audio
 
+    async def _speak(self, scenario: Scenario, text: str) -> np.ndarray:
+        if self.fake:
+            # The fake recogniser decodes fixed-length tones, so voice and speed do not apply.
+            return await FakeTTS(sample_rate=INPUT_RATE).synthesize(text)
+        audio = await self.tts.synthesize(text, voice=scenario.voice, speed=scenario.speed)
+        return resample(audio, self.tts.sample_rate, INPUT_RATE)
 
-def _settings(options: Options, stub: StubLLMServer | None) -> Settings:
+
+def _settings(options: Options, stub: StubLLMServer | None, detector: str | None = None) -> Settings:
     overrides: dict[str, Any] = {
         "weather_provider": "fixture",
         "flights_provider": "fixture",
@@ -305,7 +374,11 @@ def _settings(options: Options, stub: StubLLMServer | None) -> Settings:
     }
     if options.backends == "fake":
         overrides.update(
-            stt_backend="fake", tts_backend="fake", vad_backend="energy", energy_vad_threshold_db=FAKE_ENERGY_THRESHOLD_DB
+            stt_backend="fake",
+            tts_backend="fake",
+            vad_backend="energy",
+            energy_vad_threshold_db=FAKE_ENERGY_THRESHOLD_DB,
+            smart_turn_backend="fake",
         )
     elif options.backends == "real":
         overrides.update(stt_backend="transformers", stt_model=options.stt_model)
@@ -316,6 +389,8 @@ def _settings(options: Options, stub: StubLLMServer | None) -> Settings:
         overrides.update(llm_base_url=stub.base_url, llm_model="stub-model", llm_api_key="stub", llm_extra_query="")
     elif options.llm != "live":
         raise ConfigError(f"--llm must be stub or live, not {options.llm!r}")
+    if detector:
+        overrides["turn_detector"] = detector
     settings = load_settings(env=options.env, env_files=options.env_files, **overrides)
     if options.llm == "live":
         settings.require("llm_base_url", "llm_model", "llm_api_key")
@@ -342,7 +417,14 @@ async def _wait(predicate: Callable[[], bool], timeout: float, what: str) -> Non
 
 
 async def run_scenario(scenario: Scenario, shared: dict[str, Any], options: Options, seed: int = 0) -> ScenarioResult:
-    result = ScenarioResult(name=scenario.name, status="pass", budget_ms=scenario.ttfa_budget_ms * options.budget_scale)
+    detector = shared["detector"]
+    result = ScenarioResult(
+        name=scenario.name,
+        status="pass",
+        budget_ms=scenario.ttfa_budget_ms * options.budget_scale,
+        detector=detector,
+        scripted_turns=len(scenario.turns),
+    )
     missing = [t.audio for t in scenario.turns if t.audio and not (EVALS_DIR / t.audio).exists()]
     if missing:
         result.status = "skip"
@@ -360,13 +442,22 @@ async def run_scenario(scenario: Scenario, shared: dict[str, Any], options: Opti
     try:
         for turn in scenario.turns:
             audio = await caller.line(scenario, turn, seed)
+            lead = np.zeros(int(0.2 * INPUT_RATE), dtype=np.float32)
+            tail = np.zeros(int(TRAILING_SILENCE_S * INPUT_RATE), dtype=np.float32)
+            clip = np.concatenate([lead, audio, tail])
             if scenario.noise_snr_db is not None:
-                lead = np.zeros(int(0.2 * INPUT_RATE), dtype=np.float32)
-                tail = np.zeros(int(1.2 * INPUT_RATE), dtype=np.float32)
-                noisy = add_noise(np.concatenate([lead, audio, tail]), float(scenario.noise_snr_db), seed=seed)
-                await driver.feed(noisy, realtime=options.realtime)
-            else:
-                await driver.say(audio, realtime=options.realtime)
+                clip = add_noise(clip, float(scenario.noise_snr_db), seed=seed)
+            before = len(handler.turn_records)
+            await driver.feed(clip, realtime=options.realtime)
+            try:
+                await _wait(
+                    lambda: handler._current is not None or len(handler.turn_records) > before,
+                    10,
+                    "the turn to end",
+                )
+            except TimeoutError:
+                result.failures.append(f"no turn ended after {turn.text!r}")
+                continue
             if turn.interrupt_after_s is not None:
                 await _wait(
                     lambda: handler._current is not None and handler._current.first_audio_at is not None,
@@ -375,7 +466,7 @@ async def run_scenario(scenario: Scenario, shared: dict[str, Any], options: Opti
                 )
                 await asyncio.sleep(turn.interrupt_after_s)
                 if handler._current is None:
-                    result.failures.append(f"reply to {turn.say!r} ended before the interruption point")
+                    result.failures.append(f"reply to {turn.text!r} ended before the interruption point")
             else:
                 await driver.wait_idle(timeout=120)
         session = backends.store.peek(handler._session_id)
@@ -383,16 +474,29 @@ async def run_scenario(scenario: Scenario, shared: dict[str, Any], options: Opti
     finally:
         await driver.close()
 
-    records = [r for r in handler.turn_records if r["outcome"] != "empty"]
-    if len(records) != len(scenario.turns) or len(history) != len(scenario.turns):
-        outcomes = [r["outcome"] for r in handler.turn_records]
+    replies = [r for r in handler.turn_records if r["outcome"] != "empty"]
+    # Every reply beyond one per scripted line means a turn ended mid-line.
+    result.early_cutoffs = max(0, len(replies) - len(scenario.turns))
+    # A cut-off reply nobody heard is merged into the next one ("merged"), so
+    # dropping those leaves one record per scripted line again.
+    records = [r for r in replies if r["outcome"] != "merged"]
+    result.audible_cutoffs = max(0, len(records) - len(scenario.turns))
+    tolerated = result.early_cutoffs > 0 and detector in scenario.allow_early_cutoff
+    outcomes = ", ".join(r["outcome"] for r in handler.turn_records) or "none"
+    if result.audible_cutoffs and not tolerated:
         result.failures.append(
-            f"expected {len(scenario.turns)} turns, got {len(records)} replies ({', '.join(outcomes) or 'none'}) "
-            f"and {len(history)} history entries; the turn detector split or merged a turn"
+            f"{result.audible_cutoffs} audible early cutoff(s) with the {detector} detector ({outcomes})"
+        )
+    if len(records) != len(scenario.turns) or len(history) != len(scenario.turns):
+        if tolerated:
+            return result  # the cut split the conversation; only the cutoff is reported
+        result.failures.append(
+            f"expected {len(scenario.turns)} turns, got {len(replies)} replies ({outcomes}) "
+            f"and {len(history)} history entries"
         )
     for i, (turn, record, entry) in enumerate(zip(scenario.turns, records, history), 1):
         fails: list[str] = []
-        wer = word_error_rate(turn.say, entry.user)
+        wer = word_error_rate(turn.text, entry.user)
         if wer > scenario.max_wer:
             fails.append(f"WER {wer:.2f} > {scenario.max_wer:.2f} (heard {entry.user!r})")
         if turn.expect_tools is not None and sorted(set(record["tools"])) != sorted(set(turn.expect_tools)):
@@ -410,7 +514,7 @@ async def run_scenario(scenario: Scenario, shared: dict[str, Any], options: Opti
             fails.append("no reply audio was sent")
         result.turns.append(
             TurnResult(
-                say=turn.say,
+                say=turn.text,
                 heard=entry.user,
                 answer=entry.assistant,
                 wer=round(wer, 3),
@@ -448,32 +552,47 @@ async def run_eval(options: Options) -> EvalReport:
         stub = StubLLMServer(brain=brain).start()
     try:
         settings = _settings(options, stub)
+        if options.turn_detector == "both":
+            detectors = ["silence", "smart"]
+        elif options.turn_detector in (None, ""):
+            detectors = [settings.turn_detector]
+        elif options.turn_detector in ("silence", "smart"):
+            detectors = [options.turn_detector]
+        else:
+            raise ConfigError(f"--turn-detector must be silence, smart or both, not {options.turn_detector!r}")
         fake = options.backends == "fake"
         tts = build_tts(settings)
-        backends = build_backends(settings, stt=build_stt(settings), tts=tts, llm=build_llm(settings))
-        await backends.warm_fillers()
+        stt, llm = build_stt(settings), build_llm(settings)
         if not fake:
             # Load Whisper weights and warm ONNX sessions so the first scenario is not charged for it.
-            await backends.stt.transcribe(np.zeros(STT_SAMPLE_RATE // 2, dtype=np.float32))
+            await stt.transcribe(np.zeros(STT_SAMPLE_RATE // 2, dtype=np.float32))
             await tts.synthesize("Warming up.")
-        shared = {"backends": backends, "caller": Caller(tts, fake)}
+        caller = Caller(tts, fake)
         results: list[ScenarioResult] = []
-        for scenario in scenarios:
-            merged: ScenarioResult | None = None
-            for seed in range(options.repeats):
-                one = await run_scenario(scenario, shared, options, seed)
-                if merged is None:
-                    merged = one
-                else:
-                    merged.turns.extend(one.turns)
-                    merged.failures.extend(f"repeat {seed + 1}: {f}" for f in one.failures)
-                    if one.status == "fail":
-                        merged.status = "fail"
-                if one.status == "skip":
-                    break
-            assert merged is not None
-            _apply_budget(merged)
-            results.append(merged)
+        for detector in detectors:
+            det_settings = _settings(options, stub, detector)
+            backends = build_backends(det_settings, stt=stt, tts=tts, llm=llm)
+            await backends.warm_fillers()
+            shared = {"backends": backends, "caller": caller, "detector": detector}
+            for scenario in scenarios:
+                merged: ScenarioResult | None = None
+                for seed in range(options.repeats):
+                    one = await run_scenario(scenario, shared, options, seed)
+                    if merged is None:
+                        merged = one
+                    else:
+                        merged.turns.extend(one.turns)
+                        merged.failures.extend(f"repeat {seed + 1}: {f}" for f in one.failures)
+                        merged.early_cutoffs += one.early_cutoffs
+                        merged.audible_cutoffs += one.audible_cutoffs
+                        merged.scripted_turns += one.scripted_turns
+                        if one.status == "fail":
+                            merged.status = "fail"
+                    if one.status == "skip":
+                        break
+                assert merged is not None
+                _apply_budget(merged)
+                results.append(merged)
         if options.judge:
             from .judge import judge_report
 
@@ -489,6 +608,7 @@ async def run_eval(options: Options) -> EvalReport:
         "realtime": options.realtime,
         "budget_scale": options.budget_scale,
         "stub_delay_ms": options.stub_delay_ms,
+        "turn_detectors": detectors,
     }
     return EvalReport(options=opts, scenarios=results)
 
@@ -498,10 +618,12 @@ def _ms(value: float | None) -> str:
 
 
 def format_report(report: EvalReport) -> str:
-    rows = [("scenario", "status", "turns", "max WER", "TTFA p50", "TTFA p95", "budget")]
+    rows = [("scenario", "status", "turns", "cutoffs (audible)", "max WER", "TTFA p50", "TTFA p95", "budget")]
     for s in report.scenarios:
         wer = "-" if s.max_wer is None else f"{s.max_wer:.2f}"
-        rows.append((s.name, s.status.upper(), str(len(s.turns)), wer, _ms(s.ttfa_p50_ms), _ms(s.ttfa_p95_ms), _ms(s.budget_ms)))
+        rows.append(
+            (s.label, s.status.upper(), str(len(s.turns)), f"{s.early_cutoffs} ({s.audible_cutoffs})", wer, _ms(s.ttfa_p50_ms), _ms(s.ttfa_p95_ms), _ms(s.budget_ms))
+        )
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     lines = ["  ".join(c.ljust(w) for c, w in zip(r, widths)) for r in rows]
     lines.insert(1, "  ".join("-" * w for w in widths))
@@ -510,14 +632,21 @@ def format_report(report: EvalReport) -> str:
     lines.append(
         f"All turns: TTFA p50 {_ms(summary['ttfa_p50_ms'])} ms, p95 {_ms(summary['ttfa_p95_ms'])} ms over {summary['turns']} turns"
     )
+    for det, d in summary["detectors"].items():
+        rate = "-" if d["early_cutoff_rate"] is None else f"{d['early_cutoff_rate']:.0%}"
+        lines.append(
+            f"Turn detector {det}: early cutoffs {d['early_cutoffs']} of {d['scripted_turns']} turns ({rate}, "
+            f"{d['audible_cutoffs']} audible), "
+            f"TTFA p50 {_ms(d['ttfa_p50_ms'])} ms, p95 {_ms(d['ttfa_p95_ms'])} ms"
+        )
     stages = summary["median_stages_ms"]
     lines.append("Median stage offsets (ms after end of speech): " + ", ".join(f"{k} {_ms(v)}" for k, v in stages.items()))
     for s in report.scenarios:
         for f in s.failures:
-            lines.append(f"{s.name}: {f}")
+            lines.append(f"{s.label}: {f}")
         for t in s.turns:
             if t.judge:
-                lines.append(f"{s.name}: judge {t.judge}")
+                lines.append(f"{s.label}: judge {t.judge}")
     lines.append("")
     lines.append("PASS" if report.passed else "FAIL")
     return "\n".join(lines)
@@ -532,6 +661,9 @@ def parse_args(argv: list[str] | None) -> Options:
     parser.add_argument("--repeats", type=int, default=1, help="run every scenario this many times")
     parser.add_argument("--realtime", action="store_true", help="feed caller audio at real time (slower, closest to a browser)")
     parser.add_argument("--budget-scale", type=float, default=1.0, help="multiply every TTFA budget (slow CI machines)")
+    parser.add_argument(
+        "--turn-detector", choices=["silence", "smart", "both"], help="default: TURN_DETECTOR from the config"
+    )
     parser.add_argument("--stub-delay-ms", type=float, default=0.0, help="extra first-token delay for the stub LLM")
     parser.add_argument("--judge", action="store_true", help="grade answers with the LLM (live mode only)")
     parser.add_argument("--no-save", action="store_true", help="do not write evals/results/<time>.json")
@@ -544,6 +676,7 @@ def parse_args(argv: list[str] | None) -> Options:
         realtime=args.realtime,
         budget_scale=args.budget_scale,
         stub_delay_ms=args.stub_delay_ms,
+        turn_detector=args.turn_detector,
         judge=args.judge,
         scenarios=args.scenarios,
         save=not args.no_save,

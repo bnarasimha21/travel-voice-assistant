@@ -29,7 +29,10 @@ browser speaker <--WebRTC-- VoiceHandler.emit <------+
   conversation. "Clear conversation" resets only your session.
 - Replies play in the visitor's browser. Nothing plays on the server.
 - A turn ends when the voice activity detector (Silero by default) has heard
-  speech followed by `SILENCE_MS` of silence. No start or stop buttons.
+  speech followed by `SILENCE_MS` of silence, or, with
+  `TURN_DETECTOR=smart`, when the Smart Turn model says a short pause ends
+  a finished sentence (see [Turn detection](#turn-detection)). No start or
+  stop buttons.
 - History changes only after the LLM call succeeds: the user turn and the
   assistant turn are added together. If the LLM call fails, you hear a short
   apology and the history is left as it was.
@@ -155,6 +158,13 @@ curl -L -o models/kokoro-v1.0.int8.onnx https://github.com/thewh1teagle/kokoro-o
 curl -L -o models/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ```
 
+For `TURN_DETECTOR=smart`, also download the Smart Turn v3.2 model (about
+8 MB, BSD-2-Clause):
+
+```bash
+curl -L -o models/smart-turn-v3.2-cpu.onnx https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx
+```
+
 The full-precision `kokoro-v1.0.onnx` also works; point `TTS_MODEL_PATH` at
 it. If either file is missing the app stops at startup and names the setting
 to fix. Whisper and the Silero VAD download from Hugging Face on first run.
@@ -187,6 +197,8 @@ See `.env.example` for every setting and its default.
 | `STT_BACKEND`, `STT_MODEL` | `transformers` with a Whisper model id |
 | `TTS_BACKEND`, `TTS_MODEL_PATH`, `TTS_VOICES_PATH`, `TTS_VOICE` | Kokoro files and voice |
 | `VAD_BACKEND`, `SILENCE_MS`, `MIN_SPEECH_MS` | Turn taking |
+| `TURN_DETECTOR` | `silence` (default) or `smart` |
+| `SMART_TURN_MODEL_PATH`, `SMART_TURN_PAUSE_MS`, `SMART_TURN_MAX_SILENCE_MS`, `SMART_TURN_THRESHOLD` | Smart Turn model file, when to ask it, the fallback pause, and the "complete" cutoff |
 | `BARGE_IN`, `BARGE_IN_MIN_SPEECH_MS` | Talking over the agent |
 | `METRICS_LOG` | Per-turn latency log (`logs/turns.jsonl`), or `none` |
 | `SERVER_NAME`, `SERVER_PORT`, `SHARE`, `TURN_SERVER` | Web server |
@@ -200,7 +212,7 @@ not happen):
 
 | Stage | Meaning |
 | --- | --- |
-| `turn_end` | the turn detector decided you were done (the `SILENCE_MS` pause) |
+| `turn_end` | the turn detector decided you were done (the `SILENCE_MS` pause, or the Smart Turn decision) |
 | `stt_done` | transcript ready |
 | `llm_first_token` | first text from the model |
 | `tool_start`, `tool_end` | first tool call requested, first tool round returned |
@@ -208,9 +220,10 @@ not happen):
 | `first_audio_sent` | first reply frame handed to WebRTC: time to first audio (TTFA) |
 | `llm_done`, `reply_end` | model finished; reply finished or was interrupted |
 
-The record also has the outcome (`completed`, `interrupted`, `failed`, ...),
-the tools called and `ttfa_ms`. The page shows the last turn's breakdown and
-the session's TTFA p50 and p95 under the microphone.
+The record also has the outcome (`completed`, `interrupted`, `merged`,
+`failed`, ...), the turn detector, the tools called and `ttfa_ms`. The page
+shows the last turn's breakdown and the session's TTFA p50 and p95 under the
+microphone.
 
 Measured with `python -m evals.run --llm stub --repeats 3` (27 turns) on an
 Apple M5 laptop with 16 GB, everything on the CPU: Whisper tiny through
@@ -233,6 +246,64 @@ take roughly a third. Lowering `SILENCE_MS` is the cheapest win but cuts
 people off more often. A GPU droplet has not been measured yet; run the
 same command there and compare.
 
+## Turn detection
+
+`TURN_DETECTOR` picks how the agent decides you have finished talking.
+
+- `silence` (the default) waits for `SILENCE_MS` (700 ms) of quiet. It is
+  simple and predictable, but it cannot tell "I want to fly to, um..." from
+  a finished question, and every turn pays the full 700 ms.
+- `smart` runs [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3)
+  (an 8 MB ONNX model that listens to the last 8 seconds of your turn) after
+  every pause of `SMART_TURN_PAUSE_MS` (200 ms). If it says the sentence is
+  complete (probability at least `SMART_TURN_THRESHOLD`, 0.5) the turn ends
+  there; otherwise the agent keeps listening, asks again at the next pause,
+  and gives up waiting after `SMART_TURN_MAX_SILENCE_MS` (2000 ms) of quiet.
+  It costs about 20 ms of CPU per question asked
+  (`voice_agent/smart_turn.py`, `voice_agent/turn.py`).
+
+When either detector ends a turn too early and you keep talking before any
+reply audio has played, the handler drops the half-built reply and merges
+both parts into one turn (outcome `merged`), so the answer is right but
+later. Only a cutoff after reply audio started is heard by you.
+
+Measured on 2026-10-31 with
+`python -m evals.run --llm stub --backends real --turn-detector both --repeats 3`
+on the same Apple M5 laptop (CPU only, other jobs running), 30 scripted
+turns per detector:
+
+| | `silence` | `smart` |
+| --- | ---: | ---: |
+| Turn decided (median ms after end of speech) | 704 | 224 |
+| TTFA p50 | 2108 ms | 1914 ms |
+| TTFA p95 | 2922 ms | 3995 ms |
+| Early cutoffs (all recovered by merging) | 3 of 30 (10%) | 9 of 30 (30%) |
+| Cutoffs you would hear | 0 | 0 |
+| `mid_sentence_pause` TTFA p50 | 2880 ms (cut every time) | 1939 ms (never cut) |
+
+So Smart Turn does what it is for: it waits through "I want to fly to, um"
+followed by a one second pause, where the silence detector cut all three
+runs, and it answers ordinary questions about half a second sooner. It
+also ends turns at pauses between complete sentences that the silence
+detector sleeps through. Kokoro reads "Tell me about the best things to do
+in Los Angeles, with plenty of detail please" as two sentences with a pause
+between them, and the `barge_in` lines were cut six times in three runs;
+"Great, thank you. I will think about it and call back." was cut three
+times. Those cutoffs were merged, never heard, but each one costs the
+time of a reply that was started and thrown away, which is where the worse
+p95 comes from. Which detector is better depends on how your callers talk:
+`smart` for people who hesitate mid-sentence, `silence` for people who
+speak in several complete sentences.
+
+The caller voices are synthetic (Kokoro), which matters here. Kokoro ends
+a phrase with falling intonation even when the words are unfinished: Smart
+Turn scores "I want to fly from Los Angeles to" (no filler) at 0.76 to 0.99
+across six voices, so it would cut that, while "I want to fly to, um" scores
+0.01 to 0.02. Real hesitation sounds different and should do better; record
+some and put them in `evals/recordings/` to check. A hosted alternative is
+Deepgram Flux, which decides end of turn from the transcript and the audio
+together.
+
 ## Voice evals
 
 ```bash
@@ -240,6 +311,7 @@ python -m evals.run --llm stub    # offline: stub LLM, Whisper tiny, Kokoro, Sil
 python -m evals.run --llm live    # your configured LLM endpoint
 python -m evals.run --llm live --judge
 python -m evals.run --backends fake   # no model files at all
+python -m evals.run --llm stub --turn-detector both   # compare silence and smart
 ```
 
 Each file in `evals/scenarios/` is a short scripted conversation: the
@@ -258,6 +330,16 @@ runners are slower). It prints a table, saves JSON to `evals/results/`, and
 exits non-zero if anything failed. By default caller audio is pushed faster
 than real time; pass `--realtime` to feed it at real time instead. TTFA
 counts the end-of-turn pause either way.
+
+`--turn-detector silence|smart|both` runs every scenario with that
+detector (the default is whatever `TURN_DETECTOR` says); `both` runs each
+scenario twice and prints a line per detector with its early cutoff rate and
+TTFA. A caller line can hold a pause, written `[pause 1.0]` in seconds.
+An early cutoff is a reply the agent started before the scripted turn was
+over. It is counted, and it fails the scenario only when you would have
+heard it (the reply was not merged away), unless the scenario lists that
+detector under `allow_early_cutoff`. `mid_sentence_pause` tolerates it for
+`silence`, which is the point of that scenario.
 
 Synthetic callers are cleaner and more cooperative than real people: they
 do not hesitate, mumble or talk over background noise. Put real recordings
@@ -285,8 +367,8 @@ client. The tests drive the real `VoiceHandler` the way FastRTC does,
 pushing 20 ms microphone frames into `receive` and pulling reply audio out of
 `emit` (`voice_agent/testing/harness.py`).
 
-Tests marked `realmodels` use real Whisper (tiny), Kokoro and Silero and are
-skipped when the files are not on disk. They include a short stub-mode run
+Tests marked `realmodels` use real Whisper (tiny), Kokoro, Silero and the
+Smart Turn model and are skipped when the files are not on disk. They include a short stub-mode run
 of the eval suite on the real speech models. Run only them with
 `pytest -m realmodels`. `tests/test_tools_live.py` checks that the real
 configured model picks `get_weather` for a weather question; it runs only

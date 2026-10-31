@@ -10,9 +10,11 @@ faster than real time (tests, evals) gives the same decisions.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
 
@@ -46,6 +48,50 @@ class SilenceTurnDetector(TurnDetector):
 
     async def should_end(self, turn_audio: np.ndarray, silence_ms: float) -> bool:
         return silence_ms >= self.silence_ms
+
+
+class EndpointModel(Protocol):
+    name: str
+
+    def predict(self, audio16k: np.ndarray) -> float:
+        """Probability (0..1) that the speaker has finished the turn."""
+
+
+class SmartTurnDetector(TurnDetector):
+    """Ask an end-of-turn model at the first short pause; fall back to a long pause.
+
+    When the caller has been quiet for `pause_ms`, the model hears the turn so
+    far once. "Complete" ends the turn right there, which is sooner than the
+    silence detector. "Incomplete" (a trailing "um", a dangling "fly to")
+    keeps listening until speech resumes, or until `max_silence_ms` of
+    silence ends the turn anyway.
+    """
+
+    name = "smart"
+
+    def __init__(self, model: EndpointModel, pause_ms: int = 200, max_silence_ms: int = 2000, threshold: float = 0.5):
+        if pause_ms >= max_silence_ms:
+            raise ValueError("pause_ms must be shorter than max_silence_ms")
+        self.model = model
+        self.pause_ms = pause_ms
+        self.max_silence_ms = max_silence_ms
+        self.threshold = threshold
+        self._asked = False
+        self.last_probability: float | None = None
+        self.predictions = 0
+
+    def on_speech(self) -> None:
+        self._asked = False
+
+    async def should_end(self, turn_audio: np.ndarray, silence_ms: float) -> bool:
+        if silence_ms >= self.max_silence_ms:
+            return True
+        if self._asked or silence_ms < self.pause_ms:
+            return False
+        self._asked = True  # one inference per pause
+        self.predictions += 1
+        self.last_probability = await asyncio.to_thread(self.model.predict, turn_audio)
+        return self.last_probability > self.threshold
 
 
 @dataclass

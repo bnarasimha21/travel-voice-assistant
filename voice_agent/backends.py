@@ -8,7 +8,7 @@ from .handler import Backends
 from .llm import OpenAICompatibleLLM
 from .metrics import TurnLog
 from .session import SessionStore
-from .turn import SilenceTurnDetector, TurnDetector
+from .turn import SilenceTurnDetector, SmartTurnDetector, TurnDetector
 from .vad import EnergyVAD, SileroVAD, warm_up_silero
 
 
@@ -62,11 +62,33 @@ def vad_factory(settings: Settings):
     raise ConfigError(f"Unknown VAD_BACKEND={settings.vad_backend!r} (expected silero or energy)")
 
 
-def turn_detector_factory(settings: Settings):
-    def make() -> TurnDetector:
-        return SilenceTurnDetector(settings.silence_ms)
+def build_endpoint_model(settings: Settings):
+    backend = settings.smart_turn_backend
+    if backend == "fake":
+        from .fakes import FakeEndpointModel
 
-    return make
+        return FakeEndpointModel()
+    if backend == "onnx":
+        from .smart_turn import SmartTurnOnnxModel
+
+        return SmartTurnOnnxModel(settings.smart_turn_model_path)
+    raise ConfigError(f"Unknown SMART_TURN_BACKEND={backend!r} (expected onnx or fake)")
+
+
+def turn_detector_factory(settings: Settings, endpoint_model=None):
+    """A new detector per connection; the Smart Turn model itself is loaded once and shared."""
+    kind = settings.turn_detector
+    if kind == "silence":
+        return lambda: SilenceTurnDetector(settings.silence_ms)
+    if kind == "smart":
+        model = endpoint_model or build_endpoint_model(settings)
+        return lambda: SmartTurnDetector(
+            model,
+            pause_ms=settings.smart_turn_pause_ms,
+            max_silence_ms=settings.smart_turn_max_silence_ms,
+            threshold=settings.smart_turn_threshold,
+        )
+    raise ConfigError(f"Unknown TURN_DETECTOR={kind!r} (expected silence or smart)")
 
 
 def build_backends(
