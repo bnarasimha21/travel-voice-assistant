@@ -209,11 +209,16 @@ async def test_untolerated_audible_cutoff_fails_the_scenario(tmp_path):
         "  - say: I want to fly from Los Angeles to, um [pause 1.8] San Diego tomorrow.\n"
         "    expect_tools: [search_flights]\n"
     )
-    silence_run = await run_eval(eval_options(scenarios_dir=tmp_path, turn_detector="silence"))
+    # Real-time feeding is what makes "audible" well defined: the reply to the
+    # first half starts playing during the 1.8 s pause, so it has been heard when
+    # the caller resumes. Fed as fast as the CPU allows, the resumed speech races
+    # the reply task and the cutoff is classified "merged" (unheard) or "interrupted"
+    # depending on scheduling, which differs between machines.
+    silence_run = await run_eval(eval_options(scenarios_dir=tmp_path, turn_detector="silence", realtime=True))
     [result] = silence_run.scenarios
     assert result.audible_cutoffs == 1 and result.status == "fail"
     assert any("audible early cutoff" in f for f in result.failures), result.failures
-    smart_run = await run_eval(eval_options(scenarios_dir=tmp_path, turn_detector="smart"))
+    smart_run = await run_eval(eval_options(scenarios_dir=tmp_path, turn_detector="smart", realtime=True))
     assert smart_run.passed, smart_run.scenarios[0].failures
 
 
