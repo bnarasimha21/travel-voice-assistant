@@ -47,6 +47,7 @@ from .base import (
     ResponseDone,
     UserSpeechStarted,
     UserSpeechStopped,
+    UserItemCommitted,
     UserTranscript,
 )
 
@@ -56,6 +57,7 @@ FRAME_MS = 20
 PLAYBACK_LEAD_S = 0.06
 RECONNECT_AFTER_S = 2.0
 HISTORY_TURNS = 12  # prior turns replayed into the instructions after a reconnect
+MAX_LATE_ITEMS = 16  # caller items still waiting for a transcript after their reply
 
 
 @dataclass
@@ -94,6 +96,17 @@ class S2SReply:
     generated: bool = False  # the provider has sent the whole reply
     tools_task: asyncio.Task | None = None
     failed: bool = False
+    # Caller audio items this reply answers, by provider item id, with their
+    # transcripts so far (providers with item ids only; see S2SHandler._on_transcript).
+    items: dict[str, str] = field(default_factory=dict)
+    final_items: set[str] = field(default_factory=set)
+
+    def refresh_user(self) -> None:
+        """Rebuild the caller's words from the transcribed items."""
+        if self.items:
+            words = [self.carried, *(t.strip() for t in self.items.values())]
+            self.user = " ".join(t for t in words if t)
+            self.user_final = all(i in self.final_items for i in self.items)
 
     def spoken_text(self, heard_samples: int) -> str:
         """The share of the transcript covered by the audio actually heard."""
@@ -159,7 +172,11 @@ class S2SHandler(AsyncStreamHandler):
         self._pending_user = ""
         self._pending_final = False
         self._carry_user = ""
-        self._awaiting_transcript: tuple[Turn, str] | None = None
+        # Caller items transcribed by the provider (OpenAI) that are not in a reply yet,
+        # and items of committed turns whose transcript has not finished.
+        self._pending_items: dict[str, str] = {}
+        self._pending_item_finals: set[str] = set()
+        self._late_items: dict[str, tuple[Turn, S2SReply]] = {}
         self._cancelled: set[str] = set()
         self._play_end = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -280,6 +297,7 @@ class S2SHandler(AsyncStreamHandler):
         if self._closed:
             await adapter.aclose()
             return
+        self._forget_items()  # item ids from an earlier provider session never come back
         self.adapter = adapter
         self._reader = asyncio.create_task(self._read(adapter))
 
@@ -330,7 +348,12 @@ class S2SHandler(AsyncStreamHandler):
     def _reset_now(self) -> None:
         self._stop_reply()
         self._pending_user, self._pending_final, self._carry_user = "", False, ""
+        self._forget_items()
         self._spawn(self._close_adapter())  # the next microphone frame reconnects with no history
+
+    def _forget_items(self) -> None:
+        self._pending_items, self._pending_item_finals = {}, set()
+        self._late_items.clear()
 
     def _run_soon(self, coro) -> None:
         loop = self._loop
@@ -394,6 +417,16 @@ class S2SHandler(AsyncStreamHandler):
             reply.text += event.text
         elif isinstance(event, UserTranscript):
             self._on_transcript(event)
+        elif isinstance(event, UserItemCommitted):
+            current = self._current
+            if event.item_id in self._late_items or (current is not None and event.item_id in current.items):
+                return
+            if current is not None:
+                # The provider took a new caller turn while a reply is still open
+                # (its speech_started came before this reply's first audio): the
+                # reply is stale, so end it as a barge-in before taking the new words.
+                self.barge_in()
+            self._pending_items.setdefault(event.item_id, "")
         elif isinstance(event, UserSpeechStarted):
             self._speech_stopped_at = None
             if self._current is not None:
@@ -405,14 +438,8 @@ class S2SHandler(AsyncStreamHandler):
             self._on_response_done(event)
 
     def _on_transcript(self, event: UserTranscript) -> None:
-        late = self._awaiting_transcript
-        if late is not None:
-            if event.final:
-                self._awaiting_transcript = None
-                turn, carried = late
-                session = self.bind_session()
-                session.update_user(turn, " ".join(t for t in (carried, event.text.strip()) if t))
-                self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(), self.latency_markdown())))
+        if event.item_id:
+            self._on_item_transcript(event)
             return
         reply = self._current
         if reply is not None:
@@ -427,6 +454,45 @@ class S2SHandler(AsyncStreamHandler):
             self._pending_user, self._pending_final = event.text, True
         elif not self._pending_final:
             self._pending_user += event.text
+
+    def _on_item_transcript(self, event: UserTranscript) -> None:
+        """Route a transcript by the caller item it belongs to. OpenAI often
+        finishes transcribing after the reply is done (or never, if the
+        transcription fails), so the item id, not arrival order, decides
+        which turn the words belong to."""
+        item_id = event.item_id
+
+        def apply(items: dict[str, str], finals: set[str]) -> None:
+            if event.final:
+                # An empty final (a failed transcription) keeps any words already heard.
+                items[item_id] = event.text.strip() or items.get(item_id, "").strip()
+                finals.add(item_id)
+            elif item_id not in finals:
+                items[item_id] = items.get(item_id, "") + event.text
+
+        late = self._late_items.get(item_id)
+        if late is not None:
+            turn, reply = late
+            apply(reply.items, reply.final_items)
+            if item_id in reply.final_items:
+                del self._late_items[item_id]
+            reply.refresh_user()
+            session = self.bind_session()
+            session.update_user(turn, reply.user.strip())
+            self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(), self.latency_markdown())))
+            return
+        reply = self._current
+        if reply is not None and item_id in reply.items:
+            apply(reply.items, reply.final_items)
+            reply.refresh_user()
+            reply.timer.mark("stt_done")
+            self._show(reply)
+            return
+        if item_id in self._pending_items:
+            apply(self._pending_items, self._pending_item_finals)
+        # Otherwise the item was never committed in this provider session, or it
+        # is a turn given up on (MAX_LATE_ITEMS, a reset): its words belong to no
+        # turn that is still open, so they are dropped rather than glued onto the next.
 
     def _on_response_done(self, event: ResponseDone) -> None:
         if event.cancelled or event.response_id in self._cancelled:
@@ -468,9 +534,14 @@ class S2SHandler(AsyncStreamHandler):
             reply = S2SReply(timer=timer, carried=self._carry_user, generation=session.generation)
             reply.user = " ".join(t for t in (self._carry_user, self._pending_user.strip()) if t)
             reply.user_final = self._pending_final
-            if self._pending_user:
+            if self._pending_items:
+                reply.items = self._pending_items
+                reply.final_items = self._pending_item_finals & set(reply.items)
+                reply.refresh_user()
+            if self._pending_user or any(self._pending_items.values()):
                 timer.mark("stt_done")
             self._carry_user, self._pending_user, self._pending_final = "", "", False
+            self._pending_items, self._pending_item_finals = {}, set()
             self._speech_stopped_at = None
             self._current = reply
         if response_id:
@@ -551,11 +622,17 @@ class S2SHandler(AsyncStreamHandler):
             tool_messages=reply.tool_messages,
             generation=reply.generation,
         )
-        # The caller's transcript can arrive after the reply (OpenAI often sends
-        # it late, Gemini does not promise an order): the next final transcript
-        # then belongs to this turn, not to the next one.
-        late = turn is not None and not reply.user_final and getattr(self.adapter, "final_transcripts", False)
-        self._awaiting_transcript = (turn, reply.carried) if late else None
+        # The caller's transcript can arrive after the reply (OpenAI often
+        # sends it late): keep the turn reachable by its unfinished item ids.
+        if turn is None:
+            return
+        for item_id in reply.items:
+            if item_id not in reply.final_items:
+                self._late_items[item_id] = (turn, reply)
+        while len(self._late_items) > MAX_LATE_ITEMS:  # transcriptions that never finished
+            oldest = next(iter(self._late_items))
+            _, given_up = self._late_items.pop(oldest)
+            given_up.final_items.add(oldest)  # its turn keeps the words it has
 
     def barge_in(self) -> None:
         """The caller talked over the reply (the provider already stopped generating)."""
@@ -570,21 +647,27 @@ class S2SHandler(AsyncStreamHandler):
         response_id, heard_of_response = reply.playing_response(heard)
         if adapter is not None and response_id:
             played_ms = int(heard_of_response * 1000 / self.output_sample_rate)
-            self._spawn(self._interrupt(adapter, response_id, played_ms))
+            unheard = [r for first, r in reply.response_starts if first > heard]
+            self._spawn(self._interrupt(adapter, response_id, played_ms, unheard, reply.last_response_id))
         self._stop_reply()
         session = self.bind_session()
         if heard == 0:
             # Nothing was heard: the caller was still talking. The provider keeps
             # both utterances in its context; keep the words for the next turn.
-            self._carry_user = reply.user.strip()
+            if reply.items:  # the words are still provider items; their transcripts may be unfinished
+                self._carry_user = reply.carried
+                self._pending_items = {**reply.items, **self._pending_items}
+                self._pending_item_finals |= reply.final_items
+            else:
+                self._carry_user = reply.user.strip()
             return
         self._commit(session, reply, reply.spoken_text(heard), interrupted=True)
         self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(), self.latency_markdown())))
         log.info("session %s: barge-in after %.2f s of reply audio", session.id, heard / self.output_sample_rate)
 
-    async def _interrupt(self, adapter: RealtimeAdapter, response_id: str, played_ms: int) -> None:
+    async def _interrupt(self, adapter: RealtimeAdapter, response_id: str, played_ms: int, unheard: list[str], active: str) -> None:
         try:
-            await adapter.interrupt(response_id, played_ms)
+            await adapter.interrupt(response_id, played_ms, unheard, active)
         except Exception as exc:
             log.warning("session %s: interrupt failed: %s", self._session_id, exc)
 

@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Sequence
 
 import numpy as np
 
@@ -29,6 +29,7 @@ from .base import (
     RealtimeEvent,
     RealtimeToolCall,
     ResponseDone,
+    UserItemCommitted,
     UserSpeechStarted,
     UserSpeechStopped,
     UserTranscript,
@@ -46,7 +47,6 @@ BENIGN_ERRORS = {"response_cancel_not_active", "item_truncate_invalid_item_id"}
 class OpenAIRealtimeAdapter:
     name = "openai"
     input_sample_rate = 24000
-    final_transcripts = True  # one `completed` transcript per caller turn
     output_sample_rate = 24000
     reports_speech_stopped = True
 
@@ -120,16 +120,28 @@ class OpenAIRealtimeAdapter:
             await self._ws.send(dumps({"type": "conversation.item.create", "item": item}))
         await self._ws.send(dumps({"type": "response.create"}))
 
-    async def interrupt(self, response_id: str, played_ms: int) -> None:
-        """Stop the response (the server may already have) and forget the unplayed audio."""
+    async def interrupt(self, response_id: str, played_ms: int, unheard: Sequence[str] = (), active: str = "") -> None:
+        """Stop generating and make the model's context match what the caller heard.
+
+        `response_id` was playing when the caller cut in, `played_ms` of it was
+        heard; `unheard` responses (a later tool round) were received but never
+        played. `active` is the interrupted reply's latest response, the one
+        that may still be generating. The cancel names it: an unnamed cancel
+        sent after a burst of events could stop the reply to the caller's new
+        words instead.
+        """
         if self._ws is None:
             return
-        await self._ws.send(dumps({"type": "response.cancel", "response_id": response_id}))
+        await self._ws.send(dumps({"type": "response.cancel", "response_id": active or response_id}))
         item_id = self._items.get(response_id)
         if item_id:
             await self._ws.send(
                 dumps({"type": "conversation.item.truncate", "item_id": item_id, "content_index": 0, "audio_end_ms": max(0, played_ms)})
             )
+        for later in unheard:
+            later_item = self._items.get(later)
+            if later_item and later_item != item_id:
+                await self._ws.send(dumps({"type": "conversation.item.delete", "item_id": later_item}))
 
     async def events(self) -> AsyncIterator[RealtimeEvent]:
         ws = self._ws
@@ -163,10 +175,19 @@ class OpenAIRealtimeAdapter:
             return [UserSpeechStarted()]
         if kind == "input_audio_buffer.speech_stopped":
             return [UserSpeechStopped()]
+        if kind == "input_audio_buffer.committed":
+            return [UserItemCommitted(str(m.get("item_id", "")))] if m.get("item_id") else []
         if kind == "conversation.item.input_audio_transcription.delta":
-            return [UserTranscript(str(m.get("delta", "")), final=False)]
+            return [UserTranscript(str(m.get("delta", "")), final=False, item_id=str(m.get("item_id", "")))]
         if kind == "conversation.item.input_audio_transcription.completed":
-            return [UserTranscript(str(m.get("transcript", "")).strip(), final=True)]
+            return [UserTranscript(str(m.get("transcript", "")).strip(), final=True, item_id=str(m.get("item_id", "")))]
+        if kind == "conversation.item.input_audio_transcription.failed":
+            # No words will come for this item: settle it as empty so nothing waits on it.
+            err = m.get("error") or {}
+            return [
+                UserTranscript("", final=True, item_id=str(m.get("item_id", ""))),
+                AdapterError(f"OpenAI Realtime could not transcribe the caller: {err.get('message') or err}"),
+            ]
         if kind == "response.done":
             response = m.get("response") or {}
             calls = [

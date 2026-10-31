@@ -22,8 +22,17 @@ from voice_agent.fakes import FakeCodec
 from voice_agent.llm import OpenAICompatibleLLM, ToolCalls
 from voice_agent.metrics import TurnTimer
 from voice_agent.realtime import S2SBackends, S2SHandler
-from voice_agent.realtime.base import AudioDelta, AssistantText, RealtimeToolCall, ResponseDone, UserTranscript
+from voice_agent.realtime.base import (
+    AudioDelta,
+    AssistantText,
+    RealtimeToolCall,
+    ResponseDone,
+    UserItemCommitted,
+    UserSpeechStarted,
+    UserTranscript,
+)
 from voice_agent.realtime.gemini_live import GeminiLiveAdapter
+from voice_agent.realtime.openai_realtime import OpenAIRealtimeAdapter
 from voice_agent.realtime.handler import S2SReply
 from voice_agent.session import Session, SessionStore
 from voice_agent.testing.stub_llm import Plan, travel_brain
@@ -81,6 +90,30 @@ async def test_a_tts_error_ends_the_reply_and_the_next_question_is_answered(make
     await driver.wait_idle()
     turns = backends.store.peek("v").turns
     assert len(turns) == 1 and "San Diego" in turns[0].assistant
+
+
+class _FailingSTTOnce:
+    def __init__(self, stt):
+        self._stt, self.calls = stt, 0
+
+    async def transcribe(self, audio):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("STT crashed")
+        return await self._stt.transcribe(audio)
+
+
+async def test_a_speech_recognition_error_is_a_failed_turn_not_an_empty_one(make_backends, drivers, stub):
+    backends = make_backends(barge_in=False)
+    backends.stt = _FailingSTTOnce(backends.stt)
+    driver = await drivers(backends, "v")
+    await driver.say(spoken("what's the weather in san diego tomorrow?"))
+    await driver.wait_until(lambda: driver.handler.turn_records, what="failed turn")
+    assert driver.handler.turn_records[-1]["outcome"] == "failed"
+    assert stub.requests == []
+    await driver.say(spoken("what's the weather in san diego tomorrow?"))
+    await driver.wait_idle()
+    assert len(backends.store.peek("v").turns) == 1
 
 
 async def test_a_short_sound_during_the_reply_does_not_cut_it(make_backends, drivers, stub):
@@ -218,7 +251,6 @@ async def test_tool_calls_without_an_index_are_reassembled():
 class _NullAdapter:
     input_sample_rate = 16000
     output_sample_rate = 24000
-    final_transcripts = True
 
     def __init__(self):
         self.sent: list = []
@@ -233,8 +265,8 @@ class _NullAdapter:
     async def send_tool_results(self, results):
         self.sent.append(results)
 
-    async def interrupt(self, response_id, played_ms):
-        self.interrupts.append((response_id, played_ms))
+    async def interrupt(self, response_id, played_ms, unheard=(), active=""):
+        self.interrupts.append((response_id, played_ms, list(unheard), active))
 
     async def events(self):
         await asyncio.Event().wait()
@@ -244,9 +276,8 @@ class _NullAdapter:
         pass
 
 
-def _s2s(tools=None, final_transcripts=True):
+def _s2s(tools=None):
     adapter = _NullAdapter()
-    adapter.final_transcripts = final_transcripts
     backends = S2SBackends(make_adapter=lambda: adapter, store=SessionStore(), make_vad=EnergyVAD, tools=tools, provider="openai")
     handler = S2SHandler(backends, session_id="s", pace_output=False)
     handler.adapter = adapter
@@ -281,36 +312,205 @@ async def test_s2s_truncates_the_response_being_played():
     handler._current.emitted = 24000 + 12000
     handler.barge_in()
     await asyncio.sleep(0)
-    assert adapter.interrupts == [("r2", 500)]
+    assert adapter.interrupts == [("r2", 500, [], "r2")]
+
+
+async def test_s2s_barge_in_during_a_preamble_forgets_the_unheard_answer():
+    """The answer (r2) arrived in full while the preamble (r1) was still playing:
+    r1 is truncated where the caller cut in and r2 is dropped from the context."""
+    handler, adapter, _ = _s2s()
+    handler.bind_session()
+    second = np.zeros(24000, np.float32)
+    handler.on_event(AudioDelta(second, "r1"))
+    handler.on_event(AudioDelta(second * 3, "r2"))
+    handler._current.emitted = 6000  # a quarter second of the preamble played
+    handler.barge_in()
+    await asyncio.sleep(0)
+    assert adapter.interrupts == [("r1", 250, ["r2"], "r2")]
+
+
+async def test_s2s_a_new_caller_item_during_an_unheard_reply_merges_into_the_next_turn():
+    """speech_started reached us before the reply's first audio, so no barge-in
+    happened; the provider then commits the caller's new words. Those words
+    must not wait for the turn after."""
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
+    handler.on_event(UserItemCommitted("u1"))
+    handler.on_event(UserSpeechStarted())  # no reply yet: nothing to interrupt
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r1"))  # audio already in flight
+    handler.on_event(UserItemCommitted("u2"))
+    assert handler._current is None and "r1" in handler._cancelled
+    handler.on_event(UserTranscript("weather", final=True, item_id="u1"))
+    handler.on_event(UserTranscript("in paris", final=True, item_id="u2"))
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r2"))
+    assert handler._current.user == "weather in paris"
+    assert session.turns == []
+
+
+async def test_s2s_failed_transcription_keeps_the_words_already_heard():
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
+    _openai_turn(handler, "u1", "r1")
+    await _drain(handler)
+    handler.on_event(UserTranscript("weather in ", final=False, item_id="u1"))
+    handler.on_event(UserTranscript("", final=True, item_id="u1"))
+    await _drain(handler)
+    assert session.turns[0].user == "weather in" and not handler._late_items
+
+
+class _RecordingSocket:
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send(self, data):
+        self.sent.append(json.loads(data))
+
+
+async def test_openai_interrupt_truncates_the_heard_item_and_deletes_the_unheard_one():
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    adapter._ws = _RecordingSocket()
+    adapter._items = {"r1": "item_a", "r2": "item_b"}
+    await adapter.interrupt("r1", 250, ["r2"], active="r2")
+    assert adapter._ws.sent == [
+        {"type": "response.cancel", "response_id": "r2"},  # the one that may still be generating
+        {"type": "conversation.item.truncate", "item_id": "item_a", "content_index": 0, "audio_end_ms": 250},
+        {"type": "conversation.item.delete", "item_id": "item_b"},
+    ]
+
+
+def test_openai_transcription_events_carry_their_item():
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    assert adapter._translate({"type": "input_audio_buffer.committed", "item_id": "u1"}) == [UserItemCommitted("u1")]
+    done = adapter._translate({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u1", "transcript": " hi "})
+    assert done == [UserTranscript("hi", final=True, item_id="u1")]
+    failed = adapter._translate({"type": "conversation.item.input_audio_transcription.failed", "item_id": "u2", "error": {"message": "x"}})
+    assert failed[0] == UserTranscript("", final=True, item_id="u2")
+    assert not failed[1].fatal
+
+
+async def test_fake_openai_server_deletes_a_conversation_item():
+    from voice_agent.testing.fake_realtime import FakeOpenAIRealtime
+
+    fake = FakeOpenAIRealtime()
+    conn = type("C", (), {})()
+    conn.conversation = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "pre"}, {"role": "assistant", "content": "answer"}]
+    state = {"items": {"a": (1, "pre", 100.0), "b": (2, "answer", 100.0)}}
+    fake._delete(conn, state, "a")
+    assert [m["content"] for m in conn.conversation] == ["q", "answer"]
+    assert state["items"] == {"b": (1, "answer", 100.0)}
+
+
+def _openai_turn(handler, item: str, rid: str, said: str = "") -> None:
+    """Caller audio committed as `item`, then a whole reply `rid`, transcript not yet in."""
+    handler.on_event(UserItemCommitted(item))
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), rid))
+    handler.on_event(AssistantText(said or f"answer {rid}", rid))
+    handler.on_event(ResponseDone(rid))
 
 
 async def test_s2s_late_final_transcript_lands_on_its_own_turn():
-    handler, _, backends = _s2s()
+    handler, _, _ = _s2s()
     session = handler.bind_session()
-    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r1"))
-    handler.on_event(AssistantText("It will be sunny.", "r1"))
-    handler.on_event(ResponseDone("r1"))
+    _openai_turn(handler, "u1", "r1")
     await _drain(handler)
     assert [t.user for t in session.turns] == [""]
-    # OpenAI sent the caller's transcript after the reply.
-    handler.on_event(UserTranscript("weather in san diego", final=True))
+    # OpenAI finished transcribing the caller after the reply.
+    handler.on_event(UserTranscript("weather in ", final=False, item_id="u1"))
+    handler.on_event(UserTranscript("weather in san diego", final=True, item_id="u1"))
     await _drain(handler)
     assert [t.user for t in session.turns] == ["weather in san diego"]
     # The next turn starts clean instead of inheriting it.
-    handler.on_event(UserTranscript("and tomorrow", final=True))
+    handler.on_event(UserItemCommitted("u2"))
+    handler.on_event(UserTranscript("and tomorrow", final=True, item_id="u2"))
     handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r2"))
     assert handler._current.user == "and tomorrow"
 
 
-async def test_s2s_without_final_transcripts_does_not_wait_for_one():
-    handler, _, _ = _s2s(final_transcripts=False)
-    handler.bind_session()
+async def test_s2s_a_transcript_that_never_arrives_does_not_shift_later_turns():
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
+    _openai_turn(handler, "u1", "r1")  # u1's transcription is lost
+    await _drain(handler)
+    _openai_turn(handler, "u2", "r2")
+    await _drain(handler)
+    handler.on_event(UserTranscript("and tomorrow", final=True, item_id="u2"))
+    _openai_turn(handler, "u3", "r3")
+    await _drain(handler)
+    handler.on_event(UserTranscript("in paris", final=True, item_id="u3"))
+    await _drain(handler)
+    assert [t.user for t in session.turns] == ["", "and tomorrow", "in paris"]
+    # Transcripts out of order still land on their own turns.
+    handler.on_event(UserTranscript("weather please", final=True, item_id="u1"))
+    await _drain(handler)
+    assert [t.user for t in session.turns] == ["weather please", "and tomorrow", "in paris"]
+    assert not handler._late_items
+
+
+async def test_s2s_failed_transcription_settles_the_item():
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
+    _openai_turn(handler, "u1", "r1")
+    await _drain(handler)
+    handler.on_event(UserTranscript("", final=True, item_id="u1"))  # what a `.failed` event becomes
+    await _drain(handler)
+    assert session.turns[0].user == "" and not handler._late_items
+
+
+async def test_s2s_late_items_are_bounded_and_cleared_on_reset():
+    from voice_agent.realtime.handler import MAX_LATE_ITEMS
+
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
+    handler._loop = asyncio.get_running_loop()
+    for i in range(MAX_LATE_ITEMS + 5):
+        _openai_turn(handler, f"u{i}", f"r{i}")
+        await _drain(handler)
+    assert len(handler._late_items) == MAX_LATE_ITEMS and "u0" not in handler._late_items
+    handler.on_event(UserTranscript("given up on", final=True, item_id="u0"))
+    assert handler._pending_items == {}
+    session.reset()
+    assert not handler._late_items
+    await asyncio.sleep(0)
+    handler.on_event(UserTranscript("stale words", final=True, item_id="u20"))
+    handler.on_event(UserItemCommitted("v1"))
+    handler.on_event(UserTranscript("fresh start", final=True, item_id="v1"))
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "n1"))
+    assert handler._current.user == "fresh start"
+
+
+async def test_s2s_merged_turn_keeps_both_items_even_when_transcripts_are_late():
+    """The caller kept talking before any reply was heard: both utterances
+    become one turn, and a transcript arriving after it is still applied."""
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
+    handler.on_event(UserItemCommitted("u1"))
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r1"))
+    handler.on_event(UserSpeechStarted())  # barge-in before anything played: merged
+    assert handler._current is None and session.turns == []
+    handler.on_event(UserItemCommitted("u2"))
+    handler.on_event(UserTranscript("in san diego", final=True, item_id="u2"))
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r2"))
+    handler.on_event(AssistantText("Sunny.", "r2"))
+    handler.on_event(ResponseDone("r2"))
+    await _drain(handler)
+    assert session.turns[0].user == "in san diego"
+    handler.on_event(UserTranscript("what is the weather", final=True, item_id="u1"))
+    await _drain(handler)
+    assert session.turns[0].user == "what is the weather in san diego"
+
+
+async def test_s2s_without_item_ids_does_not_wait_for_a_transcript():
+    """Gemini sends only incremental transcripts without item ids: words go to
+    the next reply, never back onto a finished turn."""
+    handler, _, _ = _s2s()
+    session = handler.bind_session()
     handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r1"))
     handler.on_event(ResponseDone("r1"))
     await _drain(handler)
     handler.on_event(UserTranscript("next ", final=False))
     handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r2"))
     assert handler._current.user == "next"
+    assert session.turns[0].user == ""
 
 
 async def test_s2s_turn_end_while_tools_run_waits_for_the_answer():
@@ -397,8 +597,29 @@ async def test_flux_closed_while_connecting_does_not_leave_a_socket():
     await asyncio.sleep(0.01)
     await flux.aclose()
     gate.set()
-    await asyncio.gather(feeding, return_exceptions=True)
-    assert all(s.closed for s in sockets) and flux._ws is None
+    await feeding  # the cancelled connect does not raise into the audio feed
+    assert sockets == [] and flux._ws is None
+
+
+async def test_flux_handshake_finishing_during_close_is_closed_too():
+    gate = asyncio.Event()
+    sockets = []
+
+    async def connect(url, additional_headers=None):
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            pass  # the handshake completed as the cancel arrived
+        sockets.append(_BrokenSocket())
+        return sockets[-1]
+
+    flux = FluxTurnSource(url="wss://flux.test", api_key="k", model="flux", vad=EnergyVAD(), connect=connect)
+    feeding = asyncio.create_task(flux.feed(np.zeros(1280, np.float32)))
+    await asyncio.sleep(0.01)
+    await flux.aclose()
+    await feeding
+    assert len(sockets) == 1 and sockets[0].closed
+    assert flux._ws is None and flux._reader is None
 
 
 class _SlowDetector(SilenceTurnDetector):

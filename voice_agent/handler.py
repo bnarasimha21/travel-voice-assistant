@@ -483,8 +483,9 @@ class VoiceHandler(AsyncStreamHandler):
         self._current = None
         session = self.bind_session()
         if not reply.user:
-            self._record_turn(reply, "empty")
-            return None
+            # No words: a sound that was not speech, or speech recognition failed.
+            self._record_turn(reply, "failed" if reply.failed else "empty")
+            return self._outputs(session.chat_messages()) if reply.failed else None
         self._record_turn(reply, "failed" if reply.failed else "completed")
         if not reply.failed:
             answer = (reply.apologies + reply.text).strip()

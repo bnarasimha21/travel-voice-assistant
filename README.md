@@ -352,7 +352,9 @@ browser audio goes straight to the provider over a WebSocket
 back to the browser through the same FastRTC page. The same three travel
 tools are offered as provider function calls and run here, so
 `get_weather` works the same way. Talking over the reply stops it, and only
-what you heard is kept (OpenAI is told with `conversation.item.truncate`).
+what you heard is kept (OpenAI is told with `conversation.item.truncate`,
+and an answer that arrived but never played is removed with
+`conversation.item.delete`).
 The provider stops on its own while it is still generating; once it has
 sent the whole reply (it sends faster than real time), the handler's own
 VAD catches you talking over the rest of the playback. If the connection

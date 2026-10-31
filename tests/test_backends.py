@@ -316,6 +316,31 @@ async def test_s2s_barge_in_keeps_only_what_was_heard(provider, s2s_drivers):
             assert len(assistant[0]["content"]) < len(full)
 
 
+async def test_openai_late_and_failed_transcripts_stay_on_their_own_turns(s2s_drivers):
+    """OpenAI often finishes transcribing the caller after the reply, and a
+    transcription can fail outright: each line still lands on its own turn."""
+    lines = ["tell me about the beaches near los angeles.", "what about the food in santa monica?", "and the parks in pasadena?"]
+    async with FakeOpenAIRealtime(reply_speedup=0, transcripts_after_reply=True, failed_transcriptions={1}) as fake:
+        backends = build_pipeline(example_settings(**s2s_env("openai", fake)))
+        driver = await s2s_drivers(backends, "late-transcripts")
+        for n, line in enumerate(lines, start=1):
+            await driver.say(spoken(line))
+            await driver.wait_until(lambda: len(driver.handler.turn_records) == n, timeout=15, what=f"turn {n}")
+        session = backends.store.peek("late-transcripts")
+        await driver.wait_until(lambda: len(session.turns) == 3 and session.turns[2].user, timeout=10, what="last transcript")
+        await driver.wait_idle()
+
+        first, second, third = (t.user for t in session.turns)
+        assert first == lines[0]
+        # The failed one keeps the words heard before the failure, nothing more.
+        assert second and lines[1].startswith(second) and second != lines[1]
+        assert third == lines[2]
+        sent = [m["type"] for m in fake.connections[0].sent]
+        # The transcripts really did arrive after their replies.
+        assert sent.index("conversation.item.input_audio_transcription.completed") > sent.index("response.done")
+        assert any("could not transcribe" in e for e in driver.handler.errors)
+
+
 @pytest.mark.parametrize("provider", ["openai", "gemini"])
 async def test_s2s_barge_in_after_the_whole_reply_arrived(provider, s2s_drivers):
     """Providers send audio faster than it plays; once the reply is fully sent the

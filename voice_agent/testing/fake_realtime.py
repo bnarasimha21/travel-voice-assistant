@@ -222,19 +222,31 @@ class _FakeServer:
 class FakeOpenAIRealtime(_FakeServer):
     """OpenAI Realtime over WebSocket, server VAD on, `interrupt_response` behaviour.
     `semantic_vad` sessions wait through pauses after unfinished sentences;
-    `server_vad` sessions end on any pause."""
+    `server_vad` sessions end on any pause.
+
+    `transcripts_after_reply` sends each caller transcript only once the reply
+    to it is finished, as the real service often does; `failed_transcriptions`
+    lists caller turns (0-based) whose transcription fails."""
 
     path_prefix = "/v1/realtime"
 
-    def __init__(self, api_key: str = "test-openai-key", **kwargs: Any):
+    def __init__(
+        self,
+        api_key: str = "test-openai-key",
+        transcripts_after_reply: bool = False,
+        failed_transcriptions: set[int] | None = None,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         self.api_key = api_key
+        self.transcripts_after_reply = transcripts_after_reply
+        self.failed_transcriptions = set(failed_transcriptions or ())
 
     def authorised(self, path: str, headers: dict[str, str]) -> bool:
         return headers.get("authorization") == f"Bearer {self.api_key}" and "model=" in path
 
     async def session(self, ws, conn: Connection) -> None:
-        state: dict[str, Any] = {"tools": [], "task": None, "items": {}, "rid": ""}
+        state: dict[str, Any] = {"tools": [], "task": None, "items": {}, "rid": "", "late": set()}
         turns = self.turns(24000)
         await self._send(ws, conn, {"type": "session.created", "session": {"id": f"sess_{uuid.uuid4().hex[:8]}"}})
         try:
@@ -274,21 +286,50 @@ class FakeOpenAIRealtime(_FakeServer):
                 elif kind == "conversation.item.truncate":
                     self._truncate(conn, state, m)
                     await self._send(ws, conn, {"type": "conversation.item.truncated", "item_id": m.get("item_id")})
+                elif kind == "conversation.item.delete":
+                    self._delete(conn, state, m.get("item_id"))
+                    await self._send(ws, conn, {"type": "conversation.item.deleted", "item_id": m.get("item_id")})
         finally:
             task = state["task"]
             if task is not None:
                 task.cancel()
+            for late in state["late"]:
+                late.cancel()
 
     async def _end_of_turn(self, ws, conn: Connection, state: dict[str, Any], audio: np.ndarray) -> None:
         await self._send(ws, conn, {"type": "input_audio_buffer.speech_stopped"})
-        await self._send(ws, conn, {"type": "input_audio_buffer.committed", "item_id": f"item_{uuid.uuid4().hex[:8]}"})
+        user_item = f"item_{uuid.uuid4().hex[:8]}"
+        await self._send(ws, conn, {"type": "input_audio_buffer.committed", "item_id": user_item})
         text = self.codec.decode(audio, 24000)
         conn.transcripts.append(text)
         conn.conversation.append({"role": "user", "content": text})
-        for word in text.split(" "):
-            await self._send(ws, conn, {"type": "conversation.item.input_audio_transcription.delta", "delta": word + " "})
-        await self._send(ws, conn, {"type": "conversation.item.input_audio_transcription.completed", "transcript": text})
+        failed = len(conn.transcripts) - 1 in self.failed_transcriptions
+        if not self.transcripts_after_reply:
+            await self._transcribe(ws, conn, user_item, text, failed)
+            self._start_response(ws, conn, state)
+            return
         self._start_response(ws, conn, state)
+        late = asyncio.create_task(self._transcribe_after(ws, conn, state, state["task"], user_item, text, failed))
+        state["late"].add(late)
+        late.add_done_callback(state["late"].discard)
+
+    async def _transcribe(self, ws, conn: Connection, item_id: str, text: str, failed: bool) -> None:
+        words = text.split(" ")
+        for word in words[: len(words) // 2] if failed else words:
+            await self._send(ws, conn, {"type": "conversation.item.input_audio_transcription.delta", "item_id": item_id, "delta": word + " "})
+        if failed:
+            error = {"type": "transcription_error", "code": "audio_unintelligible", "message": "could not transcribe"}
+            await self._send(ws, conn, {"type": "conversation.item.input_audio_transcription.failed", "item_id": item_id, "content_index": 0, "error": error})
+        else:
+            await self._send(ws, conn, {"type": "conversation.item.input_audio_transcription.completed", "item_id": item_id, "transcript": text})
+
+    async def _transcribe_after(self, ws, conn: Connection, state: dict[str, Any], task: asyncio.Task, item_id: str, text: str, failed: bool) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.shield(task)
+        while state["task"] is not None and not state["task"].done():  # a tool round's answer
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
+        await self._transcribe(ws, conn, item_id, text, failed)
 
     def _start_response(self, ws, conn: Connection, state: dict[str, Any]) -> None:
         state["rid"] = f"resp_{uuid.uuid4().hex[:8]}"
@@ -312,6 +353,16 @@ class FakeOpenAIRealtime(_FakeServer):
         words = text.split()
         keep = int(len(words) * min(1.0, max(0, m.get("audio_end_ms", 0)) / max(total_ms, 1)))
         conn.conversation[index] = {"role": "assistant", "content": " ".join(words[:keep])}
+
+    def _delete(self, conn: Connection, state: dict[str, Any], item_id: Any) -> None:
+        entry = state["items"].pop(item_id, None)
+        if entry is None:
+            return
+        index = entry[0]
+        del conn.conversation[index]
+        for key, (i, text, total_ms) in list(state["items"].items()):
+            if i > index:
+                state["items"][key] = (i - 1, text, total_ms)
 
     async def _respond(self, ws, conn: Connection, state: dict[str, Any], rid: str) -> None:
         plan = self.brain({"messages": conn.conversation, "tools": state["tools"]})

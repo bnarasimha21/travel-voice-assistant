@@ -126,7 +126,9 @@ class FluxTurnSource:
             return False
         if self._connecting is None or self._connecting.done():
             self._connecting = asyncio.create_task(self._open())
-        await self._connecting
+        # wait() rather than await: aclose() may cancel the connect, and that
+        # must not raise CancelledError into the caller feeding audio.
+        await asyncio.wait({self._connecting})
         if self._closed and self._ws is not None:
             await self._drop(self._ws)  # closed while connecting
         return self._ws is not None

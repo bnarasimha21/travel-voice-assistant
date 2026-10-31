@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Protocol, Sequence
 
 import numpy as np
 
@@ -46,10 +46,22 @@ class AssistantText:
 
 @dataclass
 class UserTranscript:
-    """What the provider heard the caller say. `final` text replaces earlier pieces."""
+    """What the provider heard the caller say. `final` text replaces earlier pieces.
+
+    `item_id` names the caller's conversation item when the provider has one
+    (OpenAI does, Gemini does not); a transcript can arrive after the reply."""
 
     text: str
     final: bool
+    item_id: str = ""
+
+
+@dataclass
+class UserItemCommitted:
+    """The provider stored a stretch of the caller's audio as a conversation
+    item; its transcript, if any, arrives later under the same `item_id`."""
+
+    item_id: str
 
 
 @dataclass
@@ -77,13 +89,12 @@ class AdapterError:
     fatal: bool = False  # the session is gone and must be reopened
 
 
-RealtimeEvent = AudioDelta | AssistantText | UserTranscript | UserSpeechStarted | UserSpeechStopped | ResponseDone | AdapterError
+RealtimeEvent = AudioDelta | AssistantText | UserTranscript | UserItemCommitted | UserSpeechStarted | UserSpeechStopped | ResponseDone | AdapterError
 
 
 class RealtimeAdapter(Protocol):
     name: str
     input_sample_rate: int
-    final_transcripts: bool  # sends one final transcript per caller turn
     output_sample_rate: int
     reports_speech_stopped: bool
 
@@ -93,7 +104,7 @@ class RealtimeAdapter(Protocol):
 
     async def send_tool_results(self, results: list[tuple[RealtimeToolCall, str]]) -> None: ...
 
-    async def interrupt(self, response_id: str, played_ms: int) -> None: ...
+    async def interrupt(self, response_id: str, played_ms: int, unheard: Sequence[str] = (), active: str = "") -> None: ...
 
     def events(self) -> AsyncIterator[RealtimeEvent]: ...
 

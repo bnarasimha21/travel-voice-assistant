@@ -99,9 +99,18 @@ provider events -> adapter.events() -> on_event -> output queue -> emit (paced)
   `voice_agent/realtime/base.py`: `connect` (session config, instructions,
   tool declarations), `send_audio`, `send_tool_results`, `interrupt` and an
   `events()` stream translated into provider-neutral events: `AudioDelta`,
-  `AssistantText`, `UserTranscript`, `UserSpeechStarted`,
-  `UserSpeechStopped`, `ResponseDone` (with any tool calls) and
-  `AdapterError`.
+  `AssistantText`, `UserTranscript`, `UserItemCommitted`,
+  `UserSpeechStarted`, `UserSpeechStopped`, `ResponseDone` (with any tool
+  calls) and `AdapterError`.
+- **Caller transcripts.** OpenAI names each stretch of caller audio with an
+  item id (`input_audio_buffer.committed`) and often finishes transcribing
+  it after the reply. Transcripts are routed by that id: to the reply being
+  built, or back onto the committed turn it belongs to. A failed
+  transcription settles the item as empty; items still waiting are capped
+  at `MAX_LATE_ITEMS` and forgotten on a reset or reconnect, and words for an
+  item nobody is waiting on are dropped. A new caller item committed while a
+  reply is still open ends that reply as a barge-in. Gemini has no item ids,
+  so its incremental transcript always goes to the next reply.
 - **Turns** are decided by the provider. OpenAI reports
   `speech_stopped`, which becomes `turn_end`; Gemini does not, so its
   `turn_end` is null.
@@ -112,7 +121,9 @@ provider events -> adapter.events() -> on_event -> output queue -> emit (paced)
 - **Barge-in.** `UserSpeechStarted` during a reply, or the local VAD hearing
   `BARGE_IN_MIN_SPEECH_MS` of speech after the provider finished sending,
   stops playback. The heard share of the reply is committed as interrupted,
-  and the adapter's `interrupt` tells OpenAI to truncate the unheard audio
+  and the adapter's `interrupt` tells OpenAI to cancel generation, truncate
+  the response being played where the caller cut in, and delete any later
+  response (a tool-round answer) that arrived but was never played
   (Gemini stops on its own when it hears the caller, but after a local barge-in on a reply it had already finished sending, its context still holds the whole reply).
 - **Failures.** A dropped or rejected connection shows a notice in the chat
   panel. The next microphone frame reconnects after a short back-off, with

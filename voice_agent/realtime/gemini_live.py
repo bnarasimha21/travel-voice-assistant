@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Sequence
 
 import numpy as np
 
@@ -43,7 +43,6 @@ SETUP_TIMEOUT_S = 15.0
 class GeminiLiveAdapter:
     name = "gemini"
     input_sample_rate = 16000
-    final_transcripts = False  # only incremental input transcription, never a final one
     output_sample_rate = 24000
     reports_speech_stopped = False
 
@@ -110,7 +109,7 @@ class GeminiLiveAdapter:
             responses.append({"id": call.id, "name": call.name, "response": data if isinstance(data, dict) else {"result": data}})
         await self._ws.send(dumps({"toolResponse": {"functionResponses": responses}}))
 
-    async def interrupt(self, response_id: str, played_ms: int) -> None:
+    async def interrupt(self, response_id: str, played_ms: int, unheard: Sequence[str] = (), active: str = "") -> None:
         """Nothing to send: Gemini stops on its own when it hears the caller."""
 
     async def events(self) -> AsyncIterator[RealtimeEvent]:
