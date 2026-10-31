@@ -27,7 +27,7 @@ import numpy as np
 from fastrtc import AdditionalOutputs, AsyncStreamHandler
 from fastrtc.utils import current_context
 
-from .audio import STT_SAMPLE_RATE, resample, to_mono_float32
+from .audio import STT_SAMPLE_RATE, StreamResampler, to_mono_float32
 from .chunker import SentenceChunker
 from .llm import LLMError, TextDelta, ToolFinished, ToolStarted, stream_with_tools
 from .metrics import TurnLog, TurnTimer, format_breakdown, ttfa_summary
@@ -95,6 +95,8 @@ class Reply:
     turn: TurnEnded
     user: str = ""
     text: str = ""  # assistant text since the last tool round (the answer to commit)
+    apologies: str = ""  # spoken tool-failure apologies, committed ahead of `text`
+    generation: int = 0  # session generation when the reply started (see Session.commit_turn)
     tool_messages: list[dict[str, Any]] = field(default_factory=list)  # complete tool rounds
     pending_tools: list[Any] = field(default_factory=list)
     filler_used: bool = False
@@ -172,6 +174,7 @@ class VoiceHandler(AsyncStreamHandler):
                 max_turn_ms=backends.max_turn_ms,
             )
         self._out: asyncio.Queue[_Audio | _UI | _End] = asyncio.Queue()
+        self._resampler = StreamResampler(STT_SAMPLE_RATE)
         self._current: Reply | None = None
         self._carry: TurnEnded | None = None
         self._play_end = 0.0
@@ -202,8 +205,7 @@ class VoiceHandler(AsyncStreamHandler):
             self._loop = asyncio.get_running_loop()
         sample_rate, data = frame
         audio = to_mono_float32(data)
-        if sample_rate != STT_SAMPLE_RATE:
-            audio = resample(audio, sample_rate, STT_SAMPLE_RATE)
+        audio = self._resampler(audio, sample_rate)
         if self._current is not None and not self.backends.barge_in:
             # Barge-in disabled: ignore the microphone while the agent answers.
             self.turns.reset()
@@ -224,6 +226,12 @@ class VoiceHandler(AsyncStreamHandler):
                 if self._current is not None:
                     if not self.backends.barge_in:
                         continue  # a streaming STT finished a turn spoken over the reply
+                    if self._current.emitted and event.speech_ms < self.backends.barge_in_min_speech_ms:
+                        # Shorter than a barge-in (a cough, an "uh-huh") while the
+                        # reply is playing: keep talking. Before any of it plays,
+                        # the visitor was still talking, so the turns are merged.
+                        log.info("ignoring %.0f ms of speech during the reply", event.speech_ms)
+                        continue
                     self.barge_in()
                 self._start_reply(event)
 
@@ -337,11 +345,25 @@ class VoiceHandler(AsyncStreamHandler):
             turn_index=len(self.turn_records),
             end_of_turn_delay_ms=turn.end_of_turn_delay_ms,
             turn_detector=getattr(self.turns.detector, "name", ""),
+            **({"decided_at": turn.decided_at} if turn.decided_at is not None else {}),
         )
+        reply.generation = session.generation
         self._current = reply
         reply.task = asyncio.create_task(self._reply(reply))
 
     async def _reply(self, reply: Reply) -> None:
+        """Produce the reply, then always queue its end marker, so a failing
+        STT or TTS call cannot leave the handler stuck "replying" forever."""
+        try:
+            await self._produce(reply)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("reply failed for session %s", self.bind_session().id)
+            reply.failed = True
+        self._out.put_nowait(_End(reply))
+
+    async def _produce(self, reply: Reply) -> None:
         session = self.bind_session()
         turn = reply.turn
         transcript = turn.transcript
@@ -349,7 +371,6 @@ class VoiceHandler(AsyncStreamHandler):
             transcript = (await self.backends.stt.transcribe(turn.audio)).strip()
         reply.timer.mark("stt_done")
         if not transcript:
-            self._out.put_nowait(_End(reply))
             return
         reply.user = transcript
         self._out.put_nowait(_UI(self._outputs(session.chat_messages(pending_user=transcript))))
@@ -391,11 +412,17 @@ class VoiceHandler(AsyncStreamHandler):
                             if not reply.pending_tools and filler_task is not None:
                                 filler_task.cancel()
                                 filler_task = None
-                            if not event.result.ok:
+                            if not event.result.ok and not event.result.model_error:
+                                # The service failed (timeout, error, unknown place).
+                                # Malformed calls are left to the model, which sees
+                                # the error and usually retries correctly.
                                 tool = self.backends.tools.get(event.call.name)
                                 apology = tool.apology if tool else "Sorry, something went wrong with that lookup."
+                                for chunk in chunker.flush():
+                                    chunks.put_nowait(chunk)
                                 chunks.put_nowait(apology)
-                                reply.text += apology + " "
+                                reply.apologies += apology + " "
+                            if not event.result.ok:
                                 log.warning("tool %s failed: %s", event.call.name, event.result.data.get("error"))
                             if event.messages:
                                 reply.timer.mark("tool_end")
@@ -416,7 +443,6 @@ class VoiceHandler(AsyncStreamHandler):
             tts_task.cancel()
             if filler_task is not None:
                 filler_task.cancel()
-        self._out.put_nowait(_End(reply))
 
     def _show(self, session: Session, reply: Reply) -> None:
         """Update the chat panel with the turn in progress, tool calls included."""
@@ -461,7 +487,10 @@ class VoiceHandler(AsyncStreamHandler):
             return None
         self._record_turn(reply, "failed" if reply.failed else "completed")
         if not reply.failed:
-            session.commit_turn(reply.user, reply.text.strip(), tool_messages=reply.tool_messages)
+            answer = (reply.apologies + reply.text).strip()
+            session.commit_turn(
+                reply.user, answer, tool_messages=reply.tool_messages, generation=reply.generation
+            )
         return self._outputs(session.chat_messages())
 
     def barge_in(self) -> None:
@@ -481,7 +510,9 @@ class VoiceHandler(AsyncStreamHandler):
             return
         if reply.user and not reply.failed:
             spoken = reply.spoken_text(heard)
-            session.commit_turn(reply.user, spoken, interrupted=True, tool_messages=reply.tool_messages)
+            session.commit_turn(
+                reply.user, spoken, interrupted=True, tool_messages=reply.tool_messages, generation=reply.generation
+            )
             self._out.put_nowait(_UI(self._outputs(session.chat_messages())))
         log.info("session %s: barge-in after %.2f s of reply audio", session.id, heard / self.output_sample_rate)
 
@@ -528,4 +559,5 @@ def _merge_turns(first: TurnEnded, second: TurnEnded) -> TurnEnded:
         speech_end_at=second.speech_end_at,
         end_of_turn_delay_ms=second.end_of_turn_delay_ms,
         transcript=transcript,
+        decided_at=second.decided_at,
     )

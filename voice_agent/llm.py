@@ -127,7 +127,14 @@ class OpenAICompatibleLLM:
                     text.append(delta.content)
                     yield TextDelta(delta.content)
                 for tc in (delta.tool_calls if delta is not None else None) or []:
-                    slot = calls.setdefault(tc.index if tc.index is not None else len(calls), {"id": "", "name": "", "arguments": ""})
+                    key = getattr(tc, "index", None)
+                    if key is None:
+                        # Some OpenAI-compatible servers omit `index`: a new id
+                        # starts a new call, anything else continues the last one.
+                        last = max(calls) if calls else None
+                        new_call = last is None or (tc.id and calls[last]["id"] and tc.id != calls[last]["id"])
+                        key = (last + 1 if last is not None else 0) if new_call else last
+                    slot = calls.setdefault(key, {"id": "", "name": "", "arguments": ""})
                     if tc.id:
                         slot["id"] = tc.id
                     if tc.function is not None:

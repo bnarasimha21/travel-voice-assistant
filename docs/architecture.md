@@ -113,7 +113,7 @@ provider events -> adapter.events() -> on_event -> output queue -> emit (paced)
   `BARGE_IN_MIN_SPEECH_MS` of speech after the provider finished sending,
   stops playback. The heard share of the reply is committed as interrupted,
   and the adapter's `interrupt` tells OpenAI to truncate the unheard audio
-  (Gemini needs nothing).
+  (Gemini stops on its own when it hears the caller, but after a local barge-in on a reply it had already finished sending, its context still holds the whole reply).
 - **Failures.** A dropped or rejected connection shows a notice in the chat
   panel. The next microphone frame reconnects after a short back-off, with
   the conversation so far appended to the instructions.

@@ -88,7 +88,6 @@ class FluxTurnSource:
         self._closed = False
         self.in_speech = False
         self.speech_ms = 0.0
-        self.messages: list[dict[str, Any]] = []  # every server message, for logs and tests
 
     # Connection --------------------------------------------------------------
 
@@ -128,20 +127,36 @@ class FluxTurnSource:
         if self._connecting is None or self._connecting.done():
             self._connecting = asyncio.create_task(self._open())
         await self._connecting
+        if self._closed and self._ws is not None:
+            await self._drop(self._ws)  # closed while connecting
         return self._ws is not None
+
+    async def _drop(self, ws, close_stream: bool = False) -> None:
+        """Forget a connection: stop its reader and close the socket. A turn in
+        progress is lost with it; the next connection starts a fresh stream."""
+        if self._ws is ws:
+            self._ws = None
+        reader, self._reader = self._reader, None
+        if reader is not None and reader is not asyncio.current_task():
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reader
+        if close_stream:
+            with contextlib.suppress(Exception):
+                await ws.send(json.dumps({"type": "CloseStream"}))
+        with contextlib.suppress(Exception):
+            await ws.close()
+        self.reset()
 
     async def aclose(self) -> None:
         self._closed = True
-        ws, self._ws = self._ws, None
-        if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.send(json.dumps({"type": "CloseStream"}))
-            with contextlib.suppress(Exception):
-                await ws.close()
-        if self._reader is not None:
-            self._reader.cancel()
+        connecting = self._connecting
+        if connecting is not None and not connecting.done():
+            connecting.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._reader
+                await connecting
+        if self._ws is not None:
+            await self._drop(self._ws, close_stream=True)
 
     # Audio in ----------------------------------------------------------------
 
@@ -164,8 +179,9 @@ class FluxTurnSource:
                 await self._ws.send(float_to_int16(chunk).tobytes())
             except Exception as exc:
                 log.warning("Deepgram Flux send failed, reconnecting: %s", exc)
-                self._ws = None
                 self._failed_at = time.monotonic()
+                if self._ws is not None:
+                    await self._drop(self._ws)
         return []  # turn events arrive through the listener
 
     def _track_speech(self, audio16k: np.ndarray) -> None:
@@ -198,7 +214,6 @@ class FluxTurnSource:
                     message = json.loads(raw)
                 except ValueError:
                     continue
-                self.messages.append(message)
                 events = self._handle(message)
                 if events and self._listener is not None:
                     self._listener(events)
@@ -210,6 +225,7 @@ class FluxTurnSource:
             if self._ws is ws:
                 self._ws = None
                 self._failed_at = time.monotonic()
+                self.reset()  # the turn in progress went with the stream
 
     def _handle(self, message: dict[str, Any]) -> list[SpeechStarted | TurnEnded]:
         if message.get("type") == "Error":

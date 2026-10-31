@@ -25,6 +25,7 @@ class ToolResult:
     ok: bool
     data: dict[str, Any]
     elapsed_ms: float = 0.0
+    model_error: bool = False  # the call itself was malformed (unknown tool, bad or missing arguments)
 
     @property
     def content(self) -> str:
@@ -81,22 +82,22 @@ class ToolRegistry:
         """Run one call with the per-call timeout. Never raises: failures become `{"error": ...}`."""
         started = time.perf_counter()
 
-        def done(ok: bool, data: dict[str, Any]) -> ToolResult:
-            return ToolResult(name, ok, data, (time.perf_counter() - started) * 1000)
+        def done(ok: bool, data: dict[str, Any], model_error: bool = False) -> ToolResult:
+            return ToolResult(name, ok, data, (time.perf_counter() - started) * 1000, model_error)
 
         tool = self.get(name)
         if tool is None:
-            return done(False, {"error": f"unknown tool {name!r}"})
+            return done(False, {"error": f"unknown tool {name!r}"}, model_error=True)
         try:
             args = json.loads(arguments or "{}") if isinstance(arguments, str) else dict(arguments)
             if not isinstance(args, dict):
                 raise ValueError("arguments must be a JSON object")
         except ValueError as exc:
-            return done(False, {"error": f"invalid arguments: {exc}"})
+            return done(False, {"error": f"invalid arguments: {exc}"}, model_error=True)
         allowed = set(tool.parameters.get("properties", {}))
         missing = [p for p in tool.parameters.get("required", []) if p not in args]
         if missing:
-            return done(False, {"error": f"missing arguments: {', '.join(missing)}"})
+            return done(False, {"error": f"missing arguments: {', '.join(missing)}"}, model_error=True)
         args = {k: v for k, v in args.items() if k in allowed}
         try:
             data = await asyncio.wait_for(tool.handler(**args), timeout=self.timeout_s)

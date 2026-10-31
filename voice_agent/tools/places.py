@@ -22,9 +22,12 @@ def normalise_place(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", text)).strip()
 
 
-def airport_code(place: str) -> str | None:
-    """An IATA code for a code or a city we know, else None."""
+def airport_code(place: str, any_code: bool = False) -> str | None:
+    """An IATA code for a code or a city we know, else None.
+
+    With `any_code`, any three-letter code is accepted as-is (a live provider
+    knows every airport; the fixture list only covers the sample routes)."""
     raw = place.strip()
-    if re.fullmatch(r"[A-Za-z]{3}", raw) and raw.upper() in load_fixture("airports.json")["codes"]:
+    if re.fullmatch(r"[A-Za-z]{3}", raw) and (any_code or raw.upper() in load_fixture("airports.json")["codes"]):
         return raw.upper()
     return load_fixture("airports.json")["cities"].get(normalise_place(raw))

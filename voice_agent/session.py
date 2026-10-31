@@ -29,6 +29,10 @@ class Session:
         self.id = session_id
         self.created = time.time()
         self.turns: list[Turn] = []
+        # Bumped by every reset. A reply started before a reset passes the old
+        # value to `commit_turn`, which then drops it instead of adding a turn
+        # from the cleared conversation.
+        self.generation = 0
         self._reset_listeners: list[Callable[[], None]] = []
         self._lock = threading.Lock()
 
@@ -57,11 +61,23 @@ class Session:
         assistant: str,
         interrupted: bool = False,
         tool_messages: list[dict[str, Any]] | None = None,
-    ) -> Turn:
+        generation: int | None = None,
+    ) -> Turn | None:
+        """Add a user turn and its answer together. Returns None, adding
+        nothing, when `generation` is given and the session was reset since."""
         turn = Turn(user=user, assistant=assistant, interrupted=interrupted, tool_messages=list(tool_messages or []))
         with self._lock:
+            if generation is not None and generation != self.generation:
+                return None
             self.turns.append(turn)
         return turn
+
+    def update_user(self, turn: Turn, user: str) -> None:
+        """Replace the caller's words of a committed turn (a transcript that
+        arrived after the reply). No-op if the turn was cleared since."""
+        with self._lock:
+            if any(t is turn for t in self.turns):
+                turn.user = user
 
     # Display -----------------------------------------------------------------
 
@@ -95,6 +111,7 @@ class Session:
     def reset(self) -> None:
         with self._lock:
             self.turns.clear()
+            self.generation += 1
         for callback in list(self._reset_listeners):
             callback()
 

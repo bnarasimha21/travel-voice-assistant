@@ -46,6 +46,7 @@ BENIGN_ERRORS = {"response_cancel_not_active", "item_truncate_invalid_item_id"}
 class OpenAIRealtimeAdapter:
     name = "openai"
     input_sample_rate = 24000
+    final_transcripts = True  # one `completed` transcript per caller turn
     output_sample_rate = 24000
     reports_speech_stopped = True
 
@@ -123,7 +124,7 @@ class OpenAIRealtimeAdapter:
         """Stop the response (the server may already have) and forget the unplayed audio."""
         if self._ws is None:
             return
-        await self._ws.send(dumps({"type": "response.cancel"}))
+        await self._ws.send(dumps({"type": "response.cancel", "response_id": response_id}))
         item_id = self._items.get(response_id)
         if item_id:
             await self._ws.send(

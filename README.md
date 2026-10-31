@@ -66,7 +66,8 @@ answered together as one turn.
 Barge-in depends on the browser's echo cancellation (on by default) so the
 agent does not hear itself; with loud speakers and no echo cancellation, use
 headphones or set `BARGE_IN=false`. `BARGE_IN_MIN_SPEECH_MS` sets how long
-you must talk before it counts as an interruption.
+you must talk before it counts as an interruption; a shorter sound while the
+agent is talking (a cough, an "uh-huh") is ignored.
 
 Kokoro synthesizes one chunk per call. Its `create_stream` helper splits
 text into sentences itself, which the chunker already does, so it is not
@@ -385,15 +386,22 @@ not run:
 
 | config | passed | pass rate | TTFA p50 ms | TTFA p95 ms | cutoffs (audible) |
 | --- | --- | --- | --- | --- | --- |
-| whisper-tiny/silence | 7/7 | 100% | 1939 | 3182 | 1 (0) |
-| whisper-tiny/smart-turn | 7/7 | 100% | 1511 | 2384 | 3 (0) |
-| faster-whisper-tiny/silence | 7/7 | 100% | 1622 | 2486 | 1 (0) |
+| whisper-tiny/silence | 7/7 | 100% | 1708 | 2522 | 1 (0) |
+| whisper-tiny/smart-turn | 7/7 | 100% | 1224 | 1978 | 3 (0) |
+| faster-whisper-tiny/silence | 7/7 | 100% | 1840 | 3069 | 1 (0) |
 | deepgram-flux | skipped | - | - | - | needs DEEPGRAM_API_KEY |
 | s2s/openai | skipped | - | - | - | needs OPENAI_API_KEY |
 | s2s/gemini | skipped | - | - | - | needs GEMINI_API_KEY |
 
-In this run faster-whisper tiny (int8) took about 0.3 s off the median
-compared with the same model through transformers. Set the keys and rerun to fill in the
+Smart Turn answered about half a second sooner than the 700 ms silence
+rule, with the model's own inference time counted. Between the two Whisper
+runtimes the difference was within the noise of a loaded machine: an
+earlier run the same day had faster-whisper about 0.3 s ahead, this one has
+it 0.1 s behind. A cutoff the detector is allowed to make
+(`allow_early_cutoff`) that was heard splits the conversation so nothing
+else can be checked; such scenarios show as "cut off" in the passed column
+rather than as passes.
+Set the keys and rerun to fill in the
 hosted rows. `python -m evals.run --matrix --backends fake` runs the same
 matrix fully offline against local fakes of all three services
 (`voice_agent/testing/fake_realtime.py`); it checks the wiring, not the
@@ -444,7 +452,9 @@ over. It is counted, and it fails the scenario only when you would have
 heard it (the reply was not merged away), unless the scenario lists that
 detector under `allow_early_cutoff`. `mid_sentence_pause` tolerates it for
 `silence`, which is the point of that scenario, and for Gemini Live, whose
-automatic activity detection is pause-based too.
+automatic activity detection is pause-based too. A tolerated cutoff that
+was heard leaves the scenario with status `CUTOFF`: not a failure, but not a
+pass either, since the split conversation cannot be checked turn by turn.
 
 `--matrix` runs the scenarios once per row of `evals/matrix.yaml` and adds a
 comparison table (passed, pass rate, TTFA p50 and p95, cutoffs). The `real`

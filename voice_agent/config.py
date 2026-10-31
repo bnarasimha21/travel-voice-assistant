@@ -175,11 +175,13 @@ def load_settings(
     if env_files is None:
         env_files = (REPO_ROOT / ".env", REPO_ROOT / ".env.example")
     merged: dict[str, str] = {}
-    # Lowest priority first: later files are overridden by earlier ones.
-    for path in reversed(env_files):
-        if path.exists():
-            merged.update({k: v for k, v in dotenv_values(path).items() if v is not None})
-    merged.update(dict(os.environ if env is None else env))
+    # Lowest priority first: later files are overridden by earlier ones. A
+    # blank value (`KEY=`) means "not set" and leaves the lower layer's value
+    # in place; switches that can be turned off take an explicit `none`.
+    layers = [dotenv_values(path) for path in reversed(env_files) if path.exists()]
+    layers.append(dict(os.environ if env is None else env))
+    for layer in layers:
+        merged.update({k: v for k, v in layer.items() if v is not None and v.strip() != ""})
 
     kwargs: dict[str, Any] = {}
     for f in fields(Settings):

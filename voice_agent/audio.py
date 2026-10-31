@@ -42,6 +42,35 @@ def resample(audio: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
         return np.interp(x_new, x_old, audio).astype(np.float32)
 
 
+class StreamResampler:
+    """Resamples a live stream frame by frame without clicks at frame edges.
+
+    `resample` on each 20 ms frame on its own filters every frame as if the
+    signal started and stopped there; a stream resampler carries the filter
+    state across frames. Rebuilt if the input rate changes.
+    """
+
+    def __init__(self, sr_to: int):
+        self.sr_to = sr_to
+        self._sr_from: int | None = None
+        self._stream = None
+
+    def __call__(self, audio: np.ndarray, sr_from: int) -> np.ndarray:
+        if sr_from == self.sr_to:
+            return audio.astype(np.float32, copy=False)
+        if sr_from != self._sr_from:
+            self._sr_from = sr_from
+            try:
+                import soxr
+
+                self._stream = soxr.ResampleStream(sr_from, self.sr_to, 1, dtype="float32")
+            except ImportError:  # pragma: no cover - soxr ships with the requirements
+                self._stream = None
+        if self._stream is None:
+            return resample(audio, sr_from, self.sr_to)
+        return self._stream.resample_chunk(audio.astype(np.float32, copy=False))
+
+
 def float_to_int16(audio: np.ndarray) -> np.ndarray:
     return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
 

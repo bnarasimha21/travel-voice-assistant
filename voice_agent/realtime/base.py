@@ -83,6 +83,7 @@ RealtimeEvent = AudioDelta | AssistantText | UserTranscript | UserSpeechStarted 
 class RealtimeAdapter(Protocol):
     name: str
     input_sample_rate: int
+    final_transcripts: bool  # sends one final transcript per caller turn
     output_sample_rate: int
     reports_speech_stopped: bool
 

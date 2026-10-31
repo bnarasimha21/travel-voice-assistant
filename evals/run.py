@@ -261,7 +261,7 @@ class TurnResult:
 @dataclass
 class ScenarioResult:
     name: str
-    status: str  # pass | fail | skip
+    status: str  # pass | fail | skip | cutoff (a tolerated early cutoff split the conversation, nothing checked)
     turns: list[TurnResult] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     ttfa_p50_ms: float | None = None
@@ -314,6 +314,7 @@ class EvalReport:
                 "detector": runs[0].detector if runs else "",
                 "scenarios": len(runs),
                 "passed": sum(s.status == "pass" for s in runs),
+                "cut_off": sum(s.status == "cutoff" for s in runs),
                 "pass_rate": round(sum(s.status == "pass" for s in runs) / len(runs), 3) if runs else None,
                 "scripted_turns": scripted,
                 "early_cutoffs": cutoffs,
@@ -637,7 +638,11 @@ async def run_scenario(scenario: Scenario, shared: dict[str, Any], options: Opti
         )
     if len(records) != len(scenario.turns) or len(history) != len(scenario.turns):
         if tolerated:
-            return result  # the cut split the conversation; only the cutoff is reported
+            # The cut split the conversation, so the turns cannot be lined up
+            # with the script and nothing else can be checked. Not a failure
+            # (this detector is allowed to cut here), but not a pass either.
+            result.status = "cutoff"
+            return result
         result.failures.append(
             f"expected {len(scenario.turns)} turns, got {len(replies)} replies ({outcomes}) "
             f"and {len(history)} history entries"
@@ -724,7 +729,10 @@ async def _run_config(
             "caller": caller,
             "detector": _detector(settings),
             "config": config.name,
-            "realtime": config.realtime,
+            # Streaming services (and their fakes) decide turns as audio arrives
+            # and are timed on the wall clock, so burst-fed audio would make
+            # their TTFA meaningless: always feed them at real time.
+            "realtime": config.realtime or settings.pipeline == "s2s" or settings.stt_backend == "deepgram-flux",
         }
         results: list[ScenarioResult] = []
         for scenario in scenarios:
@@ -739,8 +747,8 @@ async def _run_config(
                     merged.early_cutoffs += one.early_cutoffs
                     merged.audible_cutoffs += one.audible_cutoffs
                     merged.scripted_turns += one.scripted_turns
-                    if one.status == "fail":
-                        merged.status = "fail"
+                    if one.status == "fail" or (one.status == "cutoff" and merged.status == "pass"):
+                        merged.status = one.status
                 if one.status == "skip":
                     break
             assert merged is not None
@@ -855,7 +863,7 @@ def format_matrix(report: EvalReport) -> str:
     for name, d in summary["configs"].items():
         rate = "-" if d["pass_rate"] is None else f"{d['pass_rate']:.0%}"
         rows.append(
-            (name, f"{d['passed']}/{d['scenarios']}", rate, _ms(d["ttfa_p50_ms"]), _ms(d["ttfa_p95_ms"]), f"{d['early_cutoffs']} ({d['audible_cutoffs']})")
+            (name, f"{d['passed']}/{d['scenarios']}" + (f" ({d['cut_off']} cut off)" if d["cut_off"] else ""), rate, _ms(d["ttfa_p50_ms"]), _ms(d["ttfa_p95_ms"]), f"{d['early_cutoffs']} ({d['audible_cutoffs']})")
         )
     for name, reason in report.skipped_configs.items():
         rows.append((name, "skipped", "-", "-", "-", reason))

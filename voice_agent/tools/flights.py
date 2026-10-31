@@ -24,6 +24,7 @@ MAX_RESULTS = 3
 
 class FlightProvider(ABC):
     source = "base"
+    any_airport_code = False  # True: accept any IATA code, not only the sample list
 
     @abstractmethod
     async def search(self, origin: str, destination: str, day: dt.date, adults: int, cabin: str) -> list[dict[str, Any]]:
@@ -49,10 +50,21 @@ def _iso_duration_minutes(text: str | None) -> int | None:
 
 class DuffelFlightProvider(FlightProvider):
     source = "duffel"
+    any_airport_code = True
 
-    def __init__(self, api_key: str, base_url: str, client: httpx.AsyncClient | None = None, timeout_s: float = 20.0):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        client: httpx.AsyncClient | None = None,
+        timeout_s: float = 20.0,
+        supplier_timeout_ms: int = 10000,
+    ):
         if not api_key:
             raise ToolError("DUFFEL_API_KEY is not set")
+        # Duffel accepts 2 to 60 s. It must end before the tool timeout, so a
+        # slow search returns the offers found so far instead of timing out.
+        self.supplier_timeout_ms = max(2000, min(60000, int(supplier_timeout_ms)))
         self.base_url = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {api_key}", "Duffel-Version": "v2", "Accept": "application/json"}
         self._client = client or httpx.AsyncClient(timeout=timeout_s)
@@ -67,7 +79,7 @@ class DuffelFlightProvider(FlightProvider):
         }
         resp = await self._client.post(
             f"{self.base_url}/air/offer_requests",
-            params={"return_offers": "true", "supplier_timeout": 10000},
+            params={"return_offers": "true", "supplier_timeout": self.supplier_timeout_ms},
             json=body,
             headers=self._headers,
         )
@@ -109,7 +121,8 @@ def flights_tool(provider: FlightProvider, today: dt.date | None = None) -> Tool
         day = resolve_date(date, base)
         if day < base:
             raise ToolError("that date is in the past")
-        o, d = airport_code(origin), airport_code(destination)
+        any_code = provider.any_airport_code
+        o, d = airport_code(origin, any_code), airport_code(destination, any_code)
         if o is None:
             raise ToolError(f"unknown airport or city {origin!r}; use an IATA code like LAX")
         if d is None:

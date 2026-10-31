@@ -46,7 +46,12 @@ def build_registry(settings: Settings, client: httpx.AsyncClient | None = None, 
             tools.append(flights_tool(FixtureFlightProvider(), today))
         elif kind == "duffel":
             settings.require("duffel_api_key", "duffel_base_url")
-            tools.append(flights_tool(DuffelFlightProvider(settings.duffel_api_key, settings.duffel_base_url, client), today))
+            # Leave Duffel 1.5 s of the tool timeout to send its offers back.
+            supplier_ms = int((settings.tool_timeout_s - 1.5) * 1000)
+            provider = DuffelFlightProvider(
+                settings.duffel_api_key, settings.duffel_base_url, client, supplier_timeout_ms=supplier_ms
+            )
+            tools.append(flights_tool(provider, today))
         else:
             raise ConfigError(f"Unknown FLIGHTS_PROVIDER={kind!r} (fixture or duffel)")
     if "hotels" in wanted:

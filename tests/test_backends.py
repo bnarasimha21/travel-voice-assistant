@@ -533,7 +533,7 @@ async def test_matrix_runs_the_same_scenarios_on_every_backend_offline():
     from evals.run import format_matrix, run_eval
 
     report = await run_eval(matrix_options(scenarios=["barge_in", "mid_sentence_pause"]))
-    assert report.passed, [(s.label, s.status, s.failures) for s in report.scenarios if s.status != "pass"]
+    assert report.passed, [(s.label, s.status, s.failures) for s in report.scenarios if s.status not in ("pass", "cutoff")]
     configs = report.summary()["configs"]
     assert list(configs) == ["fake/silence", "fake/smart-turn", "fake-deepgram-flux", "fake-s2s/openai", "fake-s2s/gemini"]
     assert {name: d["detector"] for name, d in configs.items()} == {
@@ -543,8 +543,13 @@ async def test_matrix_runs_the_same_scenarios_on_every_backend_offline():
         "fake-s2s/openai": "openai",
         "fake-s2s/gemini": "gemini",
     }
-    for d in configs.values():
-        assert d["scenarios"] == 2 and d["pass_rate"] == 1.0 and d["ttfa_p50_ms"] is not None
+    # An audible tolerated cutoff splits the conversation so nothing else can be
+    # checked: it is reported as "cut off", never counted as a pass. (Silence cut
+    # in too, but before any reply was heard, so the turns were merged and checked.)
+    cut_off = {"fake/silence": 0, "fake/smart-turn": 0, "fake-deepgram-flux": 0, "fake-s2s/openai": 0, "fake-s2s/gemini": 1}
+    for name, d in configs.items():
+        assert d["scenarios"] == 2 and d["ttfa_p50_ms"] is not None
+        assert (d["passed"], d["cut_off"]) == (2 - cut_off[name], cut_off[name]), name
     # Every backend stopped talking when the caller cut in, and kept what was heard.
     for s in report.scenarios:
         if s.name == "barge_in":
@@ -558,6 +563,7 @@ async def test_matrix_runs_the_same_scenarios_on_every_backend_offline():
     table = format_matrix(report)
     assert table.splitlines()[0].split("|")[1].strip() == "config"
     assert all(name in table for name in configs)
+    assert "1/2 (1 cut off)" in table
 
 
 async def test_matrix_skips_rows_without_keys_and_reports_bad_ones(tmp_path):

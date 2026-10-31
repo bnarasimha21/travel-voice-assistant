@@ -33,10 +33,10 @@ import numpy as np
 from fastrtc import AdditionalOutputs, AsyncStreamHandler
 from fastrtc.utils import current_context
 
-from ..audio import STT_SAMPLE_RATE, resample, to_mono_float32
+from ..audio import STT_SAMPLE_RATE, StreamResampler, to_mono_float32
 from ..metrics import TurnLog, TurnTimer, format_breakdown, ttfa_summary
 from ..prompts import system_prompt
-from ..session import Session, SessionStore
+from ..session import Session, SessionStore, Turn
 from ..vad import VAD, WINDOW_SAMPLES
 from .base import (
     AdapterError,
@@ -86,6 +86,9 @@ class S2SReply:
     response_ids: set[str] = field(default_factory=set)
     last_response_id: str = ""
     received: int = 0  # reply samples received from the provider
+    text_start: int = 0  # samples received before `text` began (audio of earlier tool rounds)
+    response_starts: list[tuple[int, str]] = field(default_factory=list)  # (first sample, response id)
+    generation: int = 0  # session generation when the reply started (see Session.commit_turn)
     emitted: int = 0  # reply samples handed to the transport
     first_audio_at: float | None = None
     generated: bool = False  # the provider has sent the whole reply
@@ -95,10 +98,21 @@ class S2SReply:
     def spoken_text(self, heard_samples: int) -> str:
         """The share of the transcript covered by the audio actually heard."""
         words = self.text.split()
-        if not words or self.received <= 0:
+        span = self.received - self.text_start
+        if not words or span <= 0 or heard_samples <= self.text_start:
             return ""
-        share = min(1.0, heard_samples / self.received)
+        share = min(1.0, (heard_samples - self.text_start) / span)
         return " ".join(words[: int(len(words) * share)])
+
+    def playing_response(self, heard_samples: int) -> tuple[str, int]:
+        """The response being played after `heard_samples`, and how many
+        milliseconds-worth of samples of it were heard (for truncation)."""
+        current, start = self.last_response_id, 0
+        for first, response_id in self.response_starts:
+            if first > heard_samples:
+                break
+            current, start = response_id, first
+        return current, heard_samples - start
 
 
 @dataclass
@@ -130,6 +144,8 @@ class S2SHandler(AsyncStreamHandler):
         self.session: Session | None = None
         self.vad = backends.make_vad()
         self._vad_buf = np.zeros(0, dtype=np.float32)
+        self._vad_resampler = StreamResampler(STT_SAMPLE_RATE)
+        self._send_resampler: StreamResampler | None = None
         self._last_voiced_at = 0.0
         self._voiced_ms = 0.0  # length of the current run of speech, by the local VAD
         self._speech_stopped_at: float | None = None
@@ -143,6 +159,7 @@ class S2SHandler(AsyncStreamHandler):
         self._pending_user = ""
         self._pending_final = False
         self._carry_user = ""
+        self._awaiting_transcript: tuple[Turn, str] | None = None
         self._cancelled: set[str] = set()
         self._play_end = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -174,13 +191,18 @@ class S2SHandler(AsyncStreamHandler):
             self._loop = asyncio.get_running_loop()
         sample_rate, data = frame
         audio = to_mono_float32(data)
-        audio16 = audio if sample_rate == STT_SAMPLE_RATE else resample(audio, sample_rate, STT_SAMPLE_RATE)
+        audio16 = self._vad_resampler(audio, sample_rate)
         self._track_speech(audio16)
         adapter = await self._ensure_adapter()
         if adapter is None:
             return
         rate = adapter.input_sample_rate
-        out = audio16 if rate == STT_SAMPLE_RATE else resample(audio, sample_rate, rate)
+        if rate == STT_SAMPLE_RATE:
+            out = audio16
+        else:
+            if self._send_resampler is None or self._send_resampler.sr_to != rate:
+                self._send_resampler = StreamResampler(rate)
+            out = self._send_resampler(audio, sample_rate)
         try:
             await adapter.send_audio(out)
         except Exception as exc:
@@ -358,6 +380,8 @@ class S2SHandler(AsyncStreamHandler):
             reply = self._ensure_reply(event.response_id)
             reply.timer.mark("llm_first_token")
             reply.timer.mark("tts_first_chunk")
+            if event.response_id and all(r != event.response_id for _, r in reply.response_starts):
+                reply.response_starts.append((reply.received, event.response_id))
             reply.received += event.audio.size
             frame = int(self.output_sample_rate * FRAME_MS / 1000)
             for start in range(0, event.audio.size, frame):
@@ -381,6 +405,15 @@ class S2SHandler(AsyncStreamHandler):
             self._on_response_done(event)
 
     def _on_transcript(self, event: UserTranscript) -> None:
+        late = self._awaiting_transcript
+        if late is not None:
+            if event.final:
+                self._awaiting_transcript = None
+                turn, carried = late
+                session = self.bind_session()
+                session.update_user(turn, " ".join(t for t in (carried, event.text.strip()) if t))
+                self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(), self.latency_markdown())))
+            return
         reply = self._current
         if reply is not None:
             if event.final:
@@ -404,6 +437,10 @@ class S2SHandler(AsyncStreamHandler):
                 return  # nothing was said or heard for this response
             reply = self._ensure_reply(event.response_id)
         reply.last_response_id = event.response_id or reply.last_response_id
+        if not event.calls and reply.tools_task is not None and not reply.tools_task.done():
+            # The model finished talking while its tools still run (Gemini can
+            # do this): the reply ends after it has answered with the results.
+            return
         if event.calls:
             reply.timer.mark("llm_first_token")
             reply.tools_task = self._spawn(self._run_tools(reply, event.calls))
@@ -428,7 +465,7 @@ class S2SHandler(AsyncStreamHandler):
                 turn_detector=self.backends.provider,
                 turn_end_known=known,
             )
-            reply = S2SReply(timer=timer, carried=self._carry_user)
+            reply = S2SReply(timer=timer, carried=self._carry_user, generation=session.generation)
             reply.user = " ".join(t for t in (self._carry_user, self._pending_user.strip()) if t)
             reply.user_final = self._pending_final
             if self._pending_user:
@@ -447,6 +484,7 @@ class S2SHandler(AsyncStreamHandler):
         registry = self.backends.tools
         assistant = {"role": "assistant", "content": reply.text.strip() or None, "tool_calls": [c.as_chat_call() for c in calls]}
         reply.text = ""
+        reply.text_start = reply.received
         self._show(reply, pending=[assistant])
         if registry:
             results = await asyncio.gather(*(registry.run(c.name, c.arguments) for c in calls))
@@ -502,8 +540,22 @@ class S2SHandler(AsyncStreamHandler):
             self._record_turn(reply, "empty")
             return None
         self._record_turn(reply, "completed")
-        session.commit_turn(reply.user.strip(), reply.text.strip(), tool_messages=reply.tool_messages)
+        self._commit(session, reply, reply.text.strip(), interrupted=False)
         return AdditionalOutputs(session.chat_messages(), self.latency_markdown())
+
+    def _commit(self, session: Session, reply: S2SReply, answer: str, interrupted: bool) -> None:
+        turn = session.commit_turn(
+            reply.user.strip(),
+            answer,
+            interrupted=interrupted,
+            tool_messages=reply.tool_messages,
+            generation=reply.generation,
+        )
+        # The caller's transcript can arrive after the reply (OpenAI often sends
+        # it late, Gemini does not promise an order): the next final transcript
+        # then belongs to this turn, not to the next one.
+        late = turn is not None and not reply.user_final and getattr(self.adapter, "final_transcripts", False)
+        self._awaiting_transcript = (turn, reply.carried) if late else None
 
     def barge_in(self) -> None:
         """The caller talked over the reply (the provider already stopped generating)."""
@@ -515,9 +567,10 @@ class S2SHandler(AsyncStreamHandler):
         self._record_turn(reply, "merged" if heard == 0 else "interrupted")
         self._cancelled.update(reply.response_ids)
         adapter = self.adapter
-        if adapter is not None and reply.last_response_id:
-            played_ms = int(heard * 1000 / self.output_sample_rate)
-            self._spawn(self._interrupt(adapter, reply.last_response_id, played_ms))
+        response_id, heard_of_response = reply.playing_response(heard)
+        if adapter is not None and response_id:
+            played_ms = int(heard_of_response * 1000 / self.output_sample_rate)
+            self._spawn(self._interrupt(adapter, response_id, played_ms))
         self._stop_reply()
         session = self.bind_session()
         if heard == 0:
@@ -525,7 +578,7 @@ class S2SHandler(AsyncStreamHandler):
             # both utterances in its context; keep the words for the next turn.
             self._carry_user = reply.user.strip()
             return
-        session.commit_turn(reply.user.strip(), reply.spoken_text(heard), interrupted=True, tool_messages=reply.tool_messages)
+        self._commit(session, reply, reply.spoken_text(heard), interrupted=True)
         self._out.put_nowait(_UI(AdditionalOutputs(session.chat_messages(), self.latency_markdown())))
         log.info("session %s: barge-in after %.2f s of reply audio", session.id, heard / self.output_sample_rate)
 

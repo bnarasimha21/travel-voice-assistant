@@ -43,6 +43,7 @@ SETUP_TIMEOUT_S = 15.0
 class GeminiLiveAdapter:
     name = "gemini"
     input_sample_rate = 16000
+    final_transcripts = False  # only incremental input transcription, never a final one
     output_sample_rate = 24000
     reports_speech_stopped = False
 
@@ -70,7 +71,11 @@ class GeminiLiveAdapter:
             "outputAudioTranscription": {},
         }
         if tools:
-            setup["tools"] = [{"functionDeclarations": tools.gemini_declarations()}]
+            # BLOCKING: the model waits for the tool results before it goes on.
+            # Newer Live models default to NON_BLOCKING, where the model keeps
+            # talking and can finish its turn before the results arrive.
+            declarations = [{**d, "behavior": "BLOCKING"} for d in tools.gemini_declarations()]
+            setup["tools"] = [{"functionDeclarations": declarations}]
         return {"setup": setup}
 
     async def connect(self, instructions: str, tools: Any) -> None:

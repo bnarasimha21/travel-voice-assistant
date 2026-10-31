@@ -106,6 +106,9 @@ class TurnEnded:
     speech_end_at: float  # wall clock (perf_counter) when the last voiced window was processed
     end_of_turn_delay_ms: float  # audio time from end of speech to the decision
     transcript: str | None = None  # set by streaming STT backends that do their own turn taking
+    # perf_counter when the deciding check began. A model-based detector (Smart
+    # Turn) spends time deciding; timing from here keeps that time in TTFA.
+    decided_at: float | None = None
 
 
 @dataclass
@@ -185,10 +188,11 @@ class TurnTaker:
             # A click or cough, not a turn.
             self._discard()
             return None
+        deciding_since = time.perf_counter()
         if self._turn_ms >= self.max_turn_ms or await self.detector.should_end(
             self.current_audio(), self.silence_ms
         ):
-            return self._finish()
+            return self._finish(deciding_since)
         return None
 
     def _discard(self) -> None:
@@ -199,12 +203,13 @@ class TurnTaker:
         self._turn_ms = 0.0
         self.detector.on_speech()
 
-    def _finish(self) -> TurnEnded:
+    def _finish(self, decided_at: float | None = None) -> TurnEnded:
         event = TurnEnded(
             audio=self.current_audio(),
             speech_ms=self.speech_ms,
             speech_end_at=self._last_voiced_at,
             end_of_turn_delay_ms=self.silence_ms,
+            decided_at=decided_at,
         )
         self._discard()
         return event
