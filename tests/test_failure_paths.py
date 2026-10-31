@@ -26,7 +26,9 @@ from voice_agent.realtime.base import (
     AudioDelta,
     AssistantText,
     RealtimeToolCall,
+    AdapterError,
     ResponseDone,
+    ResponseStarted,
     UserItemCommitted,
     UserSpeechStarted,
     UserTranscript,
@@ -511,6 +513,133 @@ async def test_s2s_without_item_ids_does_not_wait_for_a_transcript():
     handler.on_event(AudioDelta(np.zeros(2400, np.float32), "r2"))
     assert handler._current.user == "next"
     assert session.turns[0].user == ""
+
+
+def _weather_tools():
+    async def weather(location: str):
+        return {"forecast": "sunny"}
+
+    return ToolRegistry([Tool("get_weather", "d", {"type": "object", "properties": {"location": {"type": "string"}}}, weather)])
+
+
+async def _interrupted_tool_round(handler, adapter):
+    """Item A, a spoken preamble R1 that asks for get_weather, the tool runs and
+    its results go back (the client asks for R2), then the caller cuts in before
+    the provider has created R2, so the server's own interrupt had nothing to stop."""
+    handler.on_event(UserItemCommitted("A"))
+    handler.on_event(UserTranscript("weather in paris", final=True, item_id="A"))
+    handler.on_event(AudioDelta(np.zeros(24000, np.float32), "R1"))
+    handler.on_event(AssistantText("Let me check.", "R1"))
+    handler.on_event(ResponseDone("R1", [RealtimeToolCall("c1", "get_weather", '{"location": "Paris"}')]))
+    for _ in range(50):
+        if adapter.sent:
+            break
+        await asyncio.sleep(0.01)
+    assert adapter.sent  # response.create for R2 went out
+    handler._current.emitted = 12000  # half the preamble was heard
+    handler.on_event(UserSpeechStarted())
+    await asyncio.sleep(0)
+    assert handler._current is None and adapter.interrupts[0][0] == "R1"
+
+
+async def _finish_with_the_answer_to_b(handler, session):
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "R2"))  # the stale tool answer to A
+    handler.on_event(AssistantText("Paris is sunny.", "R2"))
+    handler.on_event(ResponseDone("R2"))
+    assert handler._current is None  # it did not open a reply
+    handler.on_event(AudioDelta(np.zeros(2400, np.float32), "R3"))
+    handler.on_event(AssistantText("Hotels in Rome are...", "R3"))
+    handler.on_event(ResponseDone("R3"))
+    await _drain(handler)
+    assert [(t.user, t.assistant, t.interrupted) for t in session.turns][-1] == ("hotels in rome", "Hotels in Rome are...", False)
+    assert all("Paris is sunny" not in t.assistant for t in session.turns)
+
+
+async def test_s2s_tool_answer_created_after_a_barge_in_is_cancelled_not_played():
+    handler, adapter, _ = _s2s(tools=_weather_tools())
+    session = handler.bind_session()
+    await _interrupted_tool_round(handler, adapter)
+    handler.on_event(ResponseStarted("R2"))  # the server creates the tool answer now
+    handler.on_event(UserItemCommitted("B"))
+    handler.on_event(UserTranscript("hotels in rome", final=True, item_id="B"))
+    await asyncio.sleep(0)
+    assert ("R2", 0, [], "R2") in adapter.interrupts  # cancelled by name
+    await _finish_with_the_answer_to_b(handler, session)
+
+
+async def test_s2s_tagged_tool_answer_is_cancelled_even_after_the_next_words_commit():
+    """The tool answer is created only after the caller's new item: the
+    metadata tag the client asked with still marks it as an orphan."""
+    handler, adapter, _ = _s2s(tools=_weather_tools())
+    session = handler.bind_session()
+    await _interrupted_tool_round(handler, adapter)
+    handler.on_event(UserItemCommitted("B"))
+    handler.on_event(UserTranscript("hotels in rome", final=True, item_id="B"))
+    handler.on_event(ResponseStarted("R2", requested=True))
+    handler.on_event(ResponseStarted("R3"))  # the server's answer to B is not touched
+    await asyncio.sleep(0)
+    assert [i[0] for i in adapter.interrupts[1:]] == ["R2"]
+    await _finish_with_the_answer_to_b(handler, session)
+
+
+async def test_s2s_a_response_created_during_the_reply_is_cancelled_by_name():
+    handler, adapter, _ = _s2s(tools=_weather_tools())
+    handler.bind_session()
+    handler.on_event(UserItemCommitted("A"))
+    handler.on_event(AudioDelta(np.zeros(24000, np.float32), "R1"))
+    handler.on_event(ResponseDone("R1", [RealtimeToolCall("c1", "get_weather", '{"location": "Paris"}')]))
+    await asyncio.sleep(0.05)
+    handler.on_event(ResponseStarted("R2", requested=True))
+    handler._current.emitted = 12000
+    handler.on_event(UserSpeechStarted())
+    await asyncio.sleep(0)
+    assert adapter.interrupts == [("R1", 500, [], "R2")]
+    assert "R2" in handler._cancelled and handler._orphan_responses == 0
+
+
+def test_openai_translates_response_created_and_tags_tool_answers():
+    from voice_agent.realtime.openai_realtime import TOOL_RESPONSE_METADATA
+
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    created = {"type": "response.created", "response": {"id": "R2", "metadata": dict(TOOL_RESPONSE_METADATA)}}
+    assert adapter._translate(created) == [ResponseStarted("R2", requested=True)]
+    assert adapter._translate({"type": "response.created", "response": {"id": "R3", "metadata": None}}) == [ResponseStarted("R3")]
+
+
+async def test_openai_tool_results_ask_for_a_tagged_response():
+    from voice_agent.realtime.openai_realtime import TOOL_RESPONSE_METADATA
+
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    adapter._ws = _RecordingSocket()
+    await adapter.send_tool_results([(RealtimeToolCall("c1", "get_weather", "{}"), "{}")])
+    assert adapter._ws.sent[-1] == {"type": "response.create", "response": {"metadata": TOOL_RESPONSE_METADATA}}
+
+
+class _RejectingAdapter(_NullAdapter):
+    async def events(self):
+        yield AdapterError("OpenAI Realtime rejected the session settings: bad model", surface=True)
+        await asyncio.Event().wait()
+
+
+async def test_a_rejected_session_update_is_shown_in_the_chat():
+    from voice_agent.realtime.openai_realtime import SESSION_UPDATE_EVENT
+
+    adapter = OpenAIRealtimeAdapter(url="wss://x", api_key="k", model="m", voice="v")
+    error = {"type": "error", "error": {"type": "invalid_request_error", "message": "bad model", "event_id": SESSION_UPDATE_EVENT}}
+    assert adapter._translate(error) == [AdapterError("OpenAI Realtime rejected the session settings: bad model", surface=True)]
+    other = adapter._translate({"type": "error", "error": {"message": "x", "event_id": "evt_other"}})
+    assert not other[0].surface
+
+    rejecting = _RejectingAdapter()
+    backends = S2SBackends(make_adapter=lambda: rejecting, store=SessionStore(), make_vad=EnergyVAD, provider="openai")
+    handler = S2SHandler(backends, session_id="s", pace_output=False)
+    handler.adapter = rejecting
+    reader = asyncio.create_task(handler._read(rejecting))
+    await asyncio.sleep(0.01)
+    shown = await handler.emit()
+    reader.cancel()
+    assert handler.adapter is rejecting  # the session keeps running
+    assert any("rejected the session settings" in str(m.get("content")) for m in shown.args[0])
 
 
 async def test_s2s_turn_end_while_tools_run_waits_for_the_answer():

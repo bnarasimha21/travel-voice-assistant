@@ -216,6 +216,13 @@ See `.env.example` for every setting and its default.
 | `METRICS_LOG` | Per-turn latency log (`logs/turns.jsonl`), or `none` |
 | `SERVER_NAME`, `SERVER_PORT`, `SHARE`, `TURN_SERVER` | Web server |
 
+`OPENAI_REALTIME_TRANSCRIBE_MODEL=gpt-live-transcribe` is unverified: its
+model page lists only `v1/realtime/transcription_sessions` as supported,
+though the realtime `session.update` reference accepts it, so check it with
+a real key. If OpenAI rejects the `session.update`, the session runs without
+the instructions, voice and tools; that rejection is shown in the chat panel
+rather than only logged.
+
 ## Latency budget
 
 Every turn is timed (`voice_agent/metrics.py`) and written as one JSON line

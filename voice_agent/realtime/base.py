@@ -75,6 +75,16 @@ class UserSpeechStopped:
 
 
 @dataclass
+class ResponseStarted:
+    """The provider created a response (before any of its audio). `requested`
+    is True when it answers tool results this client sent (OpenAI echoes the
+    metadata it was asked with)."""
+
+    response_id: str
+    requested: bool = False
+
+
+@dataclass
 class ResponseDone:
     """The model finished a response. With `calls` it is waiting for tool results."""
 
@@ -87,9 +97,10 @@ class ResponseDone:
 class AdapterError:
     message: str
     fatal: bool = False  # the session is gone and must be reopened
+    surface: bool = False  # the caller should see it (the session runs, but misconfigured)
 
 
-RealtimeEvent = AudioDelta | AssistantText | UserTranscript | UserItemCommitted | UserSpeechStarted | UserSpeechStopped | ResponseDone | AdapterError
+RealtimeEvent = AudioDelta | AssistantText | UserTranscript | UserItemCommitted | UserSpeechStarted | UserSpeechStopped | ResponseStarted | ResponseDone | AdapterError
 
 
 class RealtimeAdapter(Protocol):

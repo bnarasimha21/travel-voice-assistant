@@ -279,7 +279,7 @@ class FakeOpenAIRealtime(_FakeServer):
                     if item.get("type") == "function_call_output":
                         conn.conversation.append({"role": "tool", "tool_call_id": item.get("call_id"), "content": item.get("output", "")})
                 elif kind == "response.create":
-                    self._start_response(ws, conn, state)
+                    self._start_response(ws, conn, state, (m.get("response") or {}).get("metadata"))
                 elif kind == "response.cancel":
                     if not await self._cancel(ws, conn, state):
                         await self._send(ws, conn, {"type": "error", "error": {"type": "invalid_request_error", "code": "response_cancel_not_active", "message": "no active response"}})
@@ -331,9 +331,9 @@ class FakeOpenAIRealtime(_FakeServer):
         await asyncio.sleep(0.2)
         await self._transcribe(ws, conn, item_id, text, failed)
 
-    def _start_response(self, ws, conn: Connection, state: dict[str, Any]) -> None:
+    def _start_response(self, ws, conn: Connection, state: dict[str, Any], metadata: Any = None) -> None:
         state["rid"] = f"resp_{uuid.uuid4().hex[:8]}"
-        state["task"] = asyncio.create_task(self._respond(ws, conn, state, state["rid"]))
+        state["task"] = asyncio.create_task(self._respond(ws, conn, state, state["rid"], metadata))
 
     async def _cancel(self, ws, conn: Connection, state: dict[str, Any]) -> bool:
         task = state["task"]
@@ -364,9 +364,9 @@ class FakeOpenAIRealtime(_FakeServer):
             if i > index:
                 state["items"][key] = (i - 1, text, total_ms)
 
-    async def _respond(self, ws, conn: Connection, state: dict[str, Any], rid: str) -> None:
+    async def _respond(self, ws, conn: Connection, state: dict[str, Any], rid: str, metadata: Any = None) -> None:
         plan = self.brain({"messages": conn.conversation, "tools": state["tools"]})
-        await self._send(ws, conn, {"type": "response.created", "response": {"id": rid, "status": "in_progress"}})
+        await self._send(ws, conn, {"type": "response.created", "response": {"id": rid, "status": "in_progress", "metadata": metadata}})
         if plan.tool_calls:
             output = []
             calls = []

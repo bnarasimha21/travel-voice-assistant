@@ -45,6 +45,7 @@ from .base import (
     RealtimeAdapter,
     RealtimeToolCall,
     ResponseDone,
+    ResponseStarted,
     UserSpeechStarted,
     UserSpeechStopped,
     UserItemCommitted,
@@ -100,6 +101,7 @@ class S2SReply:
     # transcripts so far (providers with item ids only; see S2SHandler._on_transcript).
     items: dict[str, str] = field(default_factory=dict)
     final_items: set[str] = field(default_factory=set)
+    requested_response: bool = False  # tool results sent, the answer's response not seen yet
 
     def refresh_user(self) -> None:
         """Rebuild the caller's words from the transcribed items."""
@@ -177,6 +179,9 @@ class S2SHandler(AsyncStreamHandler):
         self._pending_items: dict[str, str] = {}
         self._pending_item_finals: set[str] = set()
         self._late_items: dict[str, tuple[Turn, S2SReply]] = {}
+        # Tool-answer responses asked for by replies that were interrupted before
+        # the provider created them (see _on_response_started).
+        self._orphan_responses = 0
         self._cancelled: set[str] = set()
         self._play_end = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -354,6 +359,7 @@ class S2SHandler(AsyncStreamHandler):
     def _forget_items(self) -> None:
         self._pending_items, self._pending_item_finals = {}, set()
         self._late_items.clear()
+        self._orphan_responses = 0
 
     def _run_soon(self, coro) -> None:
         loop = self._loop
@@ -386,8 +392,11 @@ class S2SHandler(AsyncStreamHandler):
                     if event.fatal:
                         self._adapter_lost(adapter, event.message)
                         return
-                    log.warning("session %s: %s", self._session_id, event.message)
-                    self.errors.append(event.message)
+                    if getattr(event, "surface", False):
+                        self._notice(event.message)
+                    else:
+                        log.warning("session %s: %s", self._session_id, event.message)
+                        self.errors.append(event.message)
                     continue
                 self.on_event(event)
         except asyncio.CancelledError:
@@ -418,6 +427,8 @@ class S2SHandler(AsyncStreamHandler):
         elif isinstance(event, UserTranscript):
             self._on_transcript(event)
         elif isinstance(event, UserItemCommitted):
+            # A response created from here on may be the server's answer to these words.
+            self._orphan_responses = 0
             current = self._current
             if event.item_id in self._late_items or (current is not None and event.item_id in current.items):
                 return
@@ -434,6 +445,8 @@ class S2SHandler(AsyncStreamHandler):
         elif isinstance(event, UserSpeechStopped):
             if self._current is None:
                 self._speech_stopped_at = time.perf_counter()
+        elif isinstance(event, ResponseStarted):
+            self._on_response_started(event)
         elif isinstance(event, ResponseDone):
             self._on_response_done(event)
 
@@ -493,6 +506,28 @@ class S2SHandler(AsyncStreamHandler):
         # Otherwise the item was never committed in this provider session, or it
         # is a turn given up on (MAX_LATE_ITEMS, a reset): its words belong to no
         # turn that is still open, so they are dropped rather than glued onto the next.
+
+    def _on_response_started(self, event: ResponseStarted) -> None:
+        """Learn a response id before its first audio. During a reply it becomes
+        the reply's latest response, so a barge-in cancels it by name. With no
+        reply open, a tool-answer response is an orphan of a reply the caller
+        already interrupted: cancel it before it plays as the answer to the
+        caller's new words."""
+        rid = event.response_id
+        if not rid or rid in self._cancelled:
+            return
+        reply = self._current
+        if reply is not None:
+            reply.response_ids.add(rid)
+            reply.last_response_id = rid
+            reply.requested_response = False
+            return
+        if event.requested or self._orphan_responses > 0:
+            self._orphan_responses = max(0, self._orphan_responses - 1)
+            self._cancelled.add(rid)
+            adapter = self.adapter
+            if adapter is not None:
+                self._spawn(self._interrupt(adapter, rid, 0, [], rid))
 
     def _on_response_done(self, event: ResponseDone) -> None:
         if event.cancelled or event.response_id in self._cancelled:
@@ -573,6 +608,7 @@ class S2SHandler(AsyncStreamHandler):
         adapter = self.adapter
         if adapter is None:
             return
+        reply.requested_response = True
         try:
             await adapter.send_tool_results(list(zip(calls, outputs)))
         except Exception as exc:
@@ -643,6 +679,8 @@ class S2SHandler(AsyncStreamHandler):
         heard = max(0, reply.emitted - int(round(self.unplayed_seconds() * self.output_sample_rate)))
         self._record_turn(reply, "merged" if heard == 0 else "interrupted")
         self._cancelled.update(reply.response_ids)
+        if reply.requested_response:
+            self._orphan_responses += 1  # its tool answer is not created yet
         adapter = self.adapter
         response_id, heard_of_response = reply.playing_response(heard)
         if adapter is not None and response_id:

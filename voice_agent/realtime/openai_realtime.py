@@ -29,6 +29,7 @@ from .base import (
     RealtimeEvent,
     RealtimeToolCall,
     ResponseDone,
+    ResponseStarted,
     UserItemCommitted,
     UserSpeechStarted,
     UserSpeechStopped,
@@ -42,6 +43,8 @@ log = logging.getLogger(__name__)
 
 # Errors the server sends when a cancel or truncate races the end of a response.
 BENIGN_ERRORS = {"response_cancel_not_active", "item_truncate_invalid_item_id"}
+SESSION_UPDATE_EVENT = "nix_session_update"  # client event id, echoed by errors about it
+TOOL_RESPONSE_METADATA = {"source": "tool_results"}  # tags responses this client asks for
 
 
 class OpenAIRealtimeAdapter:
@@ -106,7 +109,9 @@ class OpenAIRealtimeAdapter:
             additional_headers={"Authorization": f"Bearer {self.api_key}"},
             max_size=None,
         )
-        await self._ws.send(dumps({"type": "session.update", "session": self.session_config(instructions, tools)}))
+        await self._ws.send(
+            dumps({"type": "session.update", "event_id": SESSION_UPDATE_EVENT, "session": self.session_config(instructions, tools)})
+        )
 
     async def send_audio(self, audio: np.ndarray) -> None:
         if self._ws is not None and audio.size:
@@ -118,7 +123,7 @@ class OpenAIRealtimeAdapter:
         for call, output in results:
             item = {"type": "function_call_output", "call_id": call.id, "output": output}
             await self._ws.send(dumps({"type": "conversation.item.create", "item": item}))
-        await self._ws.send(dumps({"type": "response.create"}))
+        await self._ws.send(dumps({"type": "response.create", "response": {"metadata": TOOL_RESPONSE_METADATA}}))
 
     async def interrupt(self, response_id: str, played_ms: int, unheard: Sequence[str] = (), active: str = "") -> None:
         """Stop generating and make the model's context match what the caller heard.
@@ -188,6 +193,10 @@ class OpenAIRealtimeAdapter:
                 UserTranscript("", final=True, item_id=str(m.get("item_id", ""))),
                 AdapterError(f"OpenAI Realtime could not transcribe the caller: {err.get('message') or err}"),
             ]
+        if kind == "response.created":
+            response = m.get("response") or {}
+            requested = (response.get("metadata") or {}) == TOOL_RESPONSE_METADATA
+            return [ResponseStarted(str(response.get("id", "")), requested)] if response.get("id") else []
         if kind == "response.done":
             response = m.get("response") or {}
             calls = [
@@ -201,6 +210,10 @@ class OpenAIRealtimeAdapter:
             err = m.get("error") or {}
             if err.get("code") in BENIGN_ERRORS:
                 return []
+            if SESSION_UPDATE_EVENT in (err.get("event_id"), m.get("event_id")):
+                # The session keeps running, but without our instructions, voice,
+                # transcription or tools: say so where the caller can see it.
+                return [AdapterError(f"OpenAI Realtime rejected the session settings: {err.get('message') or err}", surface=True)]
             return [AdapterError(f"OpenAI Realtime error: {err.get('message') or err}")]
         return []
 
