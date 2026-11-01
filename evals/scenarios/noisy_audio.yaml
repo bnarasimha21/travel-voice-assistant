@@ -1,0 +1,9 @@
+name: noisy_audio
+description: A weather question with white noise mixed in at 15 dB SNR, silences included.
+caller: {voice: am_eric, speed: 1.0, noise_snr_db: 15}
+ttfa_budget_ms: 3500
+max_wer: 0.5
+turns:
+  - say: What is the weather in San Francisco on Saturday?
+    expect_tools: [get_weather]
+    facts: [san francisco]

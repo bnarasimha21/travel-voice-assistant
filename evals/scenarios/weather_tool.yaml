@@ -1,0 +1,8 @@
+name: weather_tool
+description: A forecast question that needs get_weather; the answer must name the place and the temperature.
+caller: {voice: am_michael, speed: 1.1}
+ttfa_budget_ms: 3500
+turns:
+  - say: What is the weather going to be like in San Diego tomorrow?
+    expect_tools: [get_weather]
+    facts: [san diego, [degrees, "°"]]

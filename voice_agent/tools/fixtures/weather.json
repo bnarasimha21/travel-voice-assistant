@@ -1,0 +1,15 @@
+{
+  "_note": "Offline sample data. Highs vary by up to +/-2 F with the date so different days differ.",
+  "places": {
+    "san diego": {"name": "San Diego, California", "high_f": 71, "low_f": 61, "code": 1},
+    "los angeles": {"name": "Los Angeles, California", "high_f": 75, "low_f": 59, "code": 0},
+    "san francisco": {"name": "San Francisco, California", "high_f": 64, "low_f": 52, "code": 3},
+    "palm springs": {"name": "Palm Springs, California", "high_f": 88, "low_f": 62, "code": 0},
+    "santa barbara": {"name": "Santa Barbara, California", "high_f": 70, "low_f": 55, "code": 2},
+    "anaheim": {"name": "Anaheim, California", "high_f": 77, "low_f": 58, "code": 1},
+    "malibu": {"name": "Malibu, California", "high_f": 70, "low_f": 57, "code": 45},
+    "big bear": {"name": "Big Bear Lake, California", "high_f": 55, "low_f": 30, "code": 71},
+    "las vegas": {"name": "Las Vegas, Nevada", "high_f": 79, "low_f": 57, "code": 0},
+    "new york": {"name": "New York, New York", "high_f": 58, "low_f": 46, "code": 61}
+  }
+}

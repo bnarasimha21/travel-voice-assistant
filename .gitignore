@@ -58,3 +58,10 @@ venv
 .venv
 audio_files/
 daily_reports/
+# Travel voice assistant
+models/
+logs/
+evals/recordings/*
+!evals/recordings/.gitkeep
+.hf-cache/
+evals/results/

@@ -1,0 +1,13 @@
+name: barge_in
+description: >
+  The caller talks over the first answer one second into it. The agent must
+  stop, keep only what was heard (marked interrupted), and answer the new
+  question.
+caller: {voice: af_bella, speed: 1.0}
+ttfa_budget_ms: 3500
+turns:
+  - say: Tell me about the best things to do in Los Angeles, with plenty of detail please.
+    interrupt_after_s: 1.0
+  - say: Actually, what is the weather in Los Angeles today?
+    expect_tools: [get_weather]
+    facts: [los angeles]
